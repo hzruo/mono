@@ -1,0 +1,22 @@
+# ------------------------------------------------------------------
+# MiniBlog 忽略规则：只提交源码与文档，运行时数据与合并产物一律忽略
+# ------------------------------------------------------------------
+
+# 运行时数据：SQLite 数据库（含 -wal/-shm）、db.php、install.lock、backups/
+# 依据：安装程序（Setup.php）与备份插件在目录缺失时会自动创建，无需入库
+/app/data/
+
+# 插件合并产物：启用插件的 css/js 合并结果
+# 依据：plugin_assets_dirty=1 或文件不存在时，下次请求自动重建，无需入库
+/app/assets/plugins.css
+/app/assets/plugins.js
+
+# 本地环境配置（可能含数据库口令），示例见 .env.example
+.env
+
+# 系统与编辑器文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

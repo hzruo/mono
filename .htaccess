@@ -1,0 +1,10 @@
+# Mono 伪静态与目录防护（Apache）。
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # 禁止访问运行时目录
+    RewriteRule ^app/(data|plugins|optional)(/|$) - [F,L]
+    # 伪静态：非真实文件/目录的请求交给 index.php
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ index.php [L,QSA]
+</IfModule>
