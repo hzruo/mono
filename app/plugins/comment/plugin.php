@@ -8,6 +8,8 @@ if (!defined('APP_ROOT')) exit;
  * - hook post.content_after：在文章正文后渲染评论列表与发表表单（详情页单次触发；平铺 1 次查询、楼中楼 2 次，无 N+1）。
  * - 楼中楼模式（可选，nested）：回复以 parent_id 挂到顶层评论下两层展示；旧库在渲染 / 提交 / 后台入口自动补列。
  * - route comment_submit：POST 提交评论（require_post + CSRF，支持游客昵称/邮箱）。
+ * - 游客身份记忆：昵称 / 邮箱存入 localStorage（mono_guest_author / mono_guest_email，与动态评论共用），有记忆即预填并将字段折叠为一行摘要。
+ * - 待审自见：先审后显模式下，提交者本机通过签名 cookie 记住自己提交的评论，待审期间可见（标「审核中」，仅本人）；通过 / 拒绝后自动移出并清理记录。
  * - route comment_delete：管理员删除评论。
  * - admin_tabs comment：插件配置子页只放设置；后台「评论」标签（admin.tabs）为分页审核列表，二者共用同一回调。
  * 数据表 plugin_comment_comments 使用插件前缀，卸载时按 keep_data 决定是否删除。
@@ -103,6 +105,18 @@ function comment_css(): string
 .comment-reply-hint b{color:var(--primary);font-weight:600}
 .comment-reply-cancel{border:0;background:transparent;padding:0 2px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
 .comment-reply-cancel:hover{color:var(--primary);background:var(--accent)}
+/* 游客昵称 / 邮箱记忆（localStorage，与动态评论共用）：填过一次即自动预填，有记忆时表单折叠为一行摘要（可展开修改） */
+.comment-guest.collapsed .form-grid-2{display:none}
+.comment-guest-remember{display:none;align-items:center;gap:2px;font-size:var(--font-size-xs);color:var(--text-subtle);margin-bottom:16px}
+.comment-guest.collapsed .comment-guest-remember{display:flex}
+.comment-guest-remember b{color:var(--primary);font-weight:600}
+.comment-guest-edit{border:0;background:transparent;padding:0 2px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
+.comment-guest-edit:hover{color:var(--primary);background:var(--accent)}
+/* 我的待审评论（先审后显时仅提交者本机可见；通过 / 拒绝后自动移出，记录同步清理） */
+.comment-mine{margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)}
+.comment-mine-note{margin-bottom:2px;font-size:var(--font-size-xs);color:var(--text-subtle)}
+.comment-mine .comment-item{opacity:.75}
+.comment-mine-tag{display:inline-block;margin-left:6px;padding:0 6px;border-radius:4px;font-size:var(--font-size-xs);line-height:18px;color:var(--warning);background:color-mix(in oklab,var(--warning) 12%,transparent);border:1px solid color-mix(in oklab,var(--warning) 32%,transparent)}
 CSS;
 }
 
@@ -127,9 +141,74 @@ function comment_tbtn(string $icon, string $label, string $attr = ''): string
         . comment_icon($icon) . '</button>';
 }
 
+// --- 我的待审评论（本机可见）---
+// 先审后显模式下，提交者通过签名 cookie 记住自己提交的评论 id（HMAC 以本机 CSRF 令牌为密钥，
+// 防伪造他人 id）；渲染时仅展示仍待审（status=0）的条目——通过（1）/ 拒绝（-1）后自动移出并清理记录。
+function comment_mine_token(int $id): string
+{
+    return substr(hash_hmac('sha256', 'comment:' . $id, csrf_token()), 0, 16);
+}
+// 解析并验签 cookie；返回 [id => true]（保持记录顺序）。
+function comment_mine_ids(): array
+{
+    $raw = (string)($_COOKIE['mono_mine_comment'] ?? '');
+    $ids = [];
+    foreach (explode(',', $raw) as $pair) {
+        $parts = explode('.', $pair, 2);
+        if (count($parts) !== 2 || !preg_match('/^[a-f0-9]{16}$/', $parts[1])) continue;
+        $id = (int)$parts[0];
+        if ($id > 0 && hash_equals(comment_mine_token($id), $parts[1])) $ids[$id] = true;
+    }
+    return $ids;
+}
+function comment_mine_write(array $ids): void
+{
+    if (headers_sent()) return;
+    if (!$ids) {
+        app_cookie('mono_mine_comment', '', time() - 3600);
+        return;
+    }
+    $pairs = [];
+    foreach (array_keys($ids) as $id) $pairs[] = $id . '.' . comment_mine_token((int)$id);
+    app_cookie('mono_mine_comment', implode(',', $pairs), time() + 2592000);   // 30 天
+}
+// 提交待审评论后登记（只保留最近 20 条，避免 cookie 膨胀）。
+function comment_mine_add(int $id): void
+{
+    $ids = comment_mine_ids();
+    $ids[$id] = true;
+    comment_mine_write(array_slice($ids, -20, null, true));
+}
+// 渲染「我的待审评论」区块：只查本文章的记录；status=0 展示（带标记），
+// 已通过 / 已拒绝（status!=0）移出 cookie；属于其他文章的记录保持不变。
+function comment_mine_html(int $post_id): string
+{
+    $ids = comment_mine_ids();
+    if (!$ids) return '';
+    $keys = array_map('intval', array_keys($ids));
+    $rows = all('SELECT * FROM plugin_comment_comments WHERE post_id=? AND id IN (' . implode(',', $keys) . ') ORDER BY id ASC', [$post_id]);
+    $seen = [];
+    $keep = [];
+    $items = '';
+    foreach ($rows as $c) {
+        $cid = (int)$c['id'];
+        $seen[$cid] = true;
+        if ((int)$c['status'] !== 0) continue;   // 审核已出结果：不再列为待审
+        $keep[$cid] = true;
+        $items .= comment_item_html($c, $post_id, 0, false, false, true);
+    }
+    $final = [];
+    foreach (array_keys($ids) as $id) {
+        if (!isset($seen[$id]) || isset($keep[$id])) $final[$id] = true;
+    }
+    if (array_diff_key($ids, $final)) comment_mine_write($final);   // 惰性清理
+    if ($items === '') return '';
+    return '<div class="comment-mine"><div class="comment-mine-note">以下是你提交的评论，正在审核中——通过后对所有人公开，目前仅你自己可见。</div>' . $items . '</div>';
+}
+
 // 渲染单条评论（顶层与楼中楼子回复共用）。$reply_id 为点击「回复」时的目标楼层（顶层楼 id）；
-// $anchor 为 true 时输出 id="comment-item-N" 供跳转锚点定位。
-function comment_item_html(array $c, int $post_id, int $reply_id, bool $nested, bool $anchor = false): string
+// $anchor 为 true 时输出 id="comment-item-N" 供跳转锚点定位；$pending 为待审条目（仅本人可见）。
+function comment_item_html(array $c, int $post_id, int $reply_id, bool $nested, bool $anchor = false, bool $pending = false): string
 {
     $author = (string)$c['author'];
     $html = '<div class="comment-item"' . ($anchor ? ' id="comment-item-' . (int)$c['id'] . '"' : '') . ' data-comment-author="' . h($author) . '">'
@@ -137,14 +216,17 @@ function comment_item_html(array $c, int $post_id, int $reply_id, bool $nested, 
         . '<div class="comment-body"><div class="comment-head">'
         . '<span class="name">' . h($author) . '</span>'
         . '<span class="time">' . h(human_time((int)$c['created_at'])) . '</span>';
+    if ($pending) $html .= '<span class="comment-mine-tag">审核中</span>';
     if (is_admin()) {
         // 楼中楼删除顶层时会连带其下回复，确认文案予以说明。
         $confirm = $nested && (int)($c['parent_id'] ?? 0) === 0 ? '删除这条评论？其下的回复将一并删除。' : '删除这条评论？';
         $html .= post_action_form(route_url('comment_delete', ['id' => (int)$c['id']]), '删除', ['post_id' => $post_id], 'btn sm danger', $confirm);
     }
-    // 回复 @：任意访客/登录用户可点；楼中楼模式下 data-reply-id 指向所属楼层。
-    $html .= '<button type="button" class="comment-reply-btn" data-reply="' . h($author) . '" data-reply-id="' . $reply_id . '">回复</button>'
-        . '</div><div class="comment-text">' . comment_format((string)$c['content']) . '</div></div></div>';
+    // 回复 @：任意访客/登录用户可点；楼中楼模式下 data-reply-id 指向所属楼层。待审条目尚未公开，不提供回复。
+    if (!$pending) {
+        $html .= '<button type="button" class="comment-reply-btn" data-reply="' . h($author) . '" data-reply-id="' . $reply_id . '">回复</button>';
+    }
+    $html .= '</div><div class="comment-text">' . comment_format((string)$c['content']) . '</div></div></div>';
     return $html;
 }
 
@@ -201,6 +283,9 @@ function comment_render_section(string $value, array $ctx): string
         $html .= paginate($total, $page, $size, $page_url);
     }
 
+    // 我的待审评论（仅提交者本机可见；通过 / 拒绝后自动移出并清理记录）。
+    $html .= comment_mine_html($post_id);
+
     // 发表表单。
     $me = me();
     if ($cfg['require_login'] && !$me) {
@@ -210,7 +295,11 @@ function comment_render_section(string $value, array $ctx): string
             . '<input type="hidden" name="post_id" value="' . $post_id . '">'
             . ($cfg['nested'] ? '<input type="hidden" name="parent_id" value="0">' : '');
         if (!$me) {
-            $html .= '<div class="form-grid-2">' . input('昵称', 'author', '', 'text', true) . input('邮箱', 'email', '', 'email', false, '你的邮箱不会公开') . '</div>';
+            // 游客身份记忆（localStorage，与动态评论共用同一对 key）：填过一次即自动预填，有记忆时折叠为一行摘要（可展开修改）。
+            $html .= '<div class="comment-guest" data-guest-fields>'
+                . '<div class="form-grid-2">' . input('昵称', 'author', '', 'text', true) . input('邮箱', 'email', '', 'email', false, '你的邮箱不会公开') . '</div>'
+                . '<div class="comment-guest-remember">以 <b class="comment-guest-remember-name"></b> 的身份评论<button type="button" class="comment-guest-edit" data-guest-edit>修改</button></div>'
+                . '</div>';
         }
         $html .= '<div class="comment-editor">' . form_field_caption('评论内容', '')
             . ($cfg['nested'] ? '<div class="comment-reply-hint" hidden>正在回复 <b class="comment-reply-hint-name"></b><button type="button" class="comment-reply-cancel" data-reply-cancel>取消</button></div>' : '')
@@ -418,10 +507,51 @@ function comment_js(): string
       if (ta.scrollIntoView) ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
     });
   }
+  // 游客身份记忆（localStorage，与动态评论共用同一对 key，键名 mono_guest_author / mono_guest_email）：
+  // 进页预填（不覆盖已有值），有昵称记忆即折叠为一行摘要，点「修改」展开；提交时写入本次填写。
+  function guestGet(k) { try { return localStorage.getItem('mono_guest_' + k) || ''; } catch (err) { return ''; } }
+  function guestSet(k, v) { try { localStorage.setItem('mono_guest_' + k, v); } catch (err) {} }
+  function bindGuestFields() {
+    var wraps = document.querySelectorAll('[data-guest-fields]');
+    for (var i = 0; i < wraps.length; i++) bindGuest(wraps[i]);
+  }
+  function bindGuest(wrap) {
+    var form = wrap.closest('form');
+    if (!form) return;
+    var author = form.querySelector('input[name="author"]');
+    if (!author) return;
+    var email = form.querySelector('input[name="email"]');
+    var a = guestGet('author');
+    if (a && !author.value) author.value = a;
+    if (email) {
+      var em = guestGet('email');
+      if (em && !email.value) email.value = em;
+    }
+    var remember = wrap.querySelector('.comment-guest-remember');
+    var nameEl = wrap.querySelector('.comment-guest-remember-name');
+    if (a && remember) {
+      wrap.classList.add('collapsed');
+      if (nameEl) nameEl.textContent = a;
+    }
+    var edit = wrap.querySelector('[data-guest-edit]');
+    if (edit) edit.addEventListener('click', function () {
+      wrap.classList.remove('collapsed');
+      author.focus();
+    });
+    form.addEventListener('submit', function () {
+      var av = author.value.trim();
+      if (av) guestSet('author', av);
+      if (email) {
+        var ev = email.value.trim();
+        if (ev) guestSet('email', ev);
+      }
+    });
+  }
   function init() {
     var editors = document.querySelectorAll('.comment-editor');
     for (var i = 0; i < editors.length; i++) bind(editors[i]);
     bindReplyButtons();
+    bindGuestFields();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
@@ -478,8 +608,9 @@ function comment_submit(array $plugin): void
 
     q('INSERT INTO plugin_comment_comments(post_id,parent_id,author,email,content,status,created_at) VALUES(?,?,?,?,?,?,?)',
         [$post_id, $parent_id, $author, $email, $content, $status, now()]);
+    if ($status === 0) comment_mine_add(app_db_last_insert_id('plugin_comment_comments'));
 
-    set_flash($status === 1 ? '评论发表成功' : '评论已提交，等待审核');
+    set_flash($status === 1 ? '评论发表成功' : '评论已提交，审核中（仅你自己可见）');
     // 新内容直接跳到能看到自己的位置：楼中楼的回复定位到所属楼层页（锚点直达楼层），其余跳到最后一页。
     $back = route_url('post', ['id' => $post_id]) . '#comment';
     if ($status === 1) {
@@ -593,8 +724,8 @@ function comment_admin(array $plugin): string
 return [
     'id' => 'comment',
     'name' => '评论',
-    'version' => '1.6.0',
-    'description' => '为文章开启评论功能，支持游客或登录后发表、先审后显（管理员评论与回复免审）与后台分页审核（后台导航「评论」标签直达列表，插件配置页只保留设置），可选楼中楼模式（回复嵌套在对应评论下方）；可在写文章页按文章单独关闭评论；评论框带图标工具栏（表情/加粗/斜体/代码/链接）与 @回复，内容支持轻量行内格式。',
+    'version' => '1.8.0',
+    'description' => '为文章开启评论功能，支持游客或登录后发表、先审后显（管理员评论与回复免审）与后台分页审核（后台导航「评论」标签直达列表，插件配置页只保留设置），可选楼中楼模式（回复嵌套在对应评论下方）；游客昵称 / 邮箱填过一次即自动预填，有记忆时折叠为一行摘要；待审评论仅提交者本人可见（标「审核中」，通过 / 拒绝后自动隐藏）；可在写文章页按文章单独关闭评论；评论框带图标工具栏（表情/加粗/斜体/代码/链接）与 @回复，内容支持轻量行内格式。',
     'author' => 'Mono',
     'assets' => ['css' => 'comment_css', 'js' => 'comment_js'],
     'hooks' => ['post.content_after' => 'comment_render_section', 'admin.tabs' => 'comment_admin_tabs'],

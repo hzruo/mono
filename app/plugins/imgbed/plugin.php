@@ -9,6 +9,8 @@ if (!defined('APP_ROOT')) exit;
  * - 写文章页工具栏注入「上传图片」按钮：选图 → AJAX 上传 → 以 Markdown 自动插入光标处。
  * - 上传记录存 plugin_imgbed_files；后台「图床」标签分页浏览（复制链接 / 删除，
  *   删除时尽力同步删除远端对象）；「插件 → 图床」配置页管理凭据与图片处理开关。
+ * - 跨插件复用：imgbed_handle_upload / imgbed_delete_file 供其它插件直接调用
+ *   （如动态插件的图片直传图床与级联删除），调用方只需先 plugin_load 本插件。
  * - 图片处理：去 EXIF 默认开（JPEG 按拍摄方向纠正并剥离元数据，GIF 跳过防丢动画）；
  *   自动压缩默认关（超最长边等比缩放，JPEG / WebP 按质量重编码）。
  *
@@ -233,14 +235,19 @@ function imgbed_store(array $cfg, string $method, string $key, string $mime, ?st
     [$url, $headers, $error] = imgbed_signed_request($cfg, $method, $key, $mime, $bytes);
     if ($error !== '') return [false, $error];
     [$ok, $status, $body] = imgbed_http($method, $url, $headers, $bytes, $method === 'PUT' ? 120 : 30);
-    // WebDAV 父目录不存在时服务器返回 409：逐级 MKCOL 后重试一次。
-    if ($method === 'PUT' && $ok && $status === 409 && $cfg['source'] === 'webdav') {
+    // WebDAV 父目录不存在：标准返回 409 Conflict，部分服务器（如 TeraCloud）返回 403；两种情况均逐级 MKCOL 后重试一次。
+    if ($method === 'PUT' && $ok && in_array($status, [403, 409], true) && $cfg['source'] === 'webdav') {
         imgbed_webdav_mkdir($cfg, $key);
         [$ok, $status, $body] = imgbed_http($method, $url, $headers, $bytes, 120);
     }
     if (!$ok) return [false, $body];
     if ($status >= 200 && $status < 300) return [true, ''];
-    return [false, 'HTTP ' . $status . imgbed_err_snip($body)];
+    $hint = '';
+    if ($cfg['source'] === 'webdav') {
+        if ($status === 401) $hint = '（WebDAV 认证失败：请检查用户名 / 密码）';
+        elseif ($status === 403) $hint = '（无写入权限，或目标目录无法自动创建）';
+    }
+    return [false, 'HTTP ' . $status . $hint . imgbed_err_snip($body)];
 }
 
 // WebDAV：逐级创建对象键中的目录（已存在返回 405，一并忽略）。
@@ -259,6 +266,27 @@ function imgbed_webdav_mkdir(array $cfg, string $key): void
         $path .= '/' . rawurlencode($seg);
         imgbed_http('MKCOL', $path, $headers, null, 30);
     }
+}
+
+// WebDAV：保存配置时预创建「地址」自身的目录链。已存在时标准返回 405，TeraCloud 等非标实现返回 301/302 重定向（不跟随），一并视为成功；失败不阻断保存。
+function imgbed_webdav_ensure(array $cfg): array
+{
+    $w = $cfg['webdav'];
+    $u = parse_url(rtrim($w['base_url'], '/'));
+    if (!is_array($u) || empty($u['host'])) return [false, '地址格式无效'];
+    $headers = [];
+    if ($w['username'] !== '' || $w['password'] !== '') {
+        $headers[] = 'Authorization: Basic ' . base64_encode($w['username'] . ':' . $w['password']);
+    }
+    $path = $u['scheme'] . '://' . $u['host'] . (isset($u['port']) ? ':' . $u['port'] : '');
+    foreach (explode('/', trim((string)($u['path'] ?? ''), '/')) as $seg) {
+        if ($seg === '') continue;
+        $path .= '/' . rawurlencode($seg);
+        [$ok, $status] = imgbed_http('MKCOL', $path, $headers, null, 30);
+        if (!$ok) return [false, '网络错误'];
+        if (!in_array($status, [200, 201, 204, 301, 302, 405], true)) return [false, 'HTTP ' . $status];
+    }
+    return [true, ''];
 }
 
 // --- 对象键与访问地址 ---
@@ -406,7 +434,43 @@ function imgbed_test(array $cfg): array
     if (!$ok) return [false, $err];
     [$dok, $derr] = imgbed_store($cfg, 'DELETE', $key, '', null);
     $url = imgbed_public_url($cfg, $key);
-    return [true, '上传成功（' . $url . '），探测对象' . ($dok ? '已清理' : '清理失败：' . $derr)];
+    // WebDAV 多数网盘（InfiniCLOUD / TeraCloud 等）dav 路径强制认证：未配访问域名（反代）时提示链接不可匿名访问。
+    $tip = ($cfg['source'] === 'webdav' && $cfg['url_prefix'] === '')
+        ? '。注意：若你的网盘要求登录（多数公网网盘如此），以上链接访客无法打开，需自建反代并在「访问域名」填写反代域名'
+        : '';
+    return [true, '上传成功（' . $url . '），探测对象' . ($dok ? '已清理' : '清理失败：' . $derr) . $tip];
+}
+
+// 单文件上传到当前图床配置（图床路由与跨插件复用）：校验 → 图像处理 → 上传 → 记入图床管理列表。
+// 返回 json_response 风格数组：成功 ['ok'=>1,'url','name','note']；失败 ['ok'=>0,'message']。
+function imgbed_handle_upload(array $f, int $max_bytes = 10485760): array
+{
+    $cfg = imgbed_config();
+    if (!imgbed_ready($cfg)) return ['ok' => 0, 'message' => '图床尚未配置完成，请到「后台 → 图床 → 设置」填写凭据'];
+    if ((int)($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return ['ok' => 0, 'message' => '未收到上传文件'];
+    if ((int)$f['error'] !== UPLOAD_ERR_OK) return ['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）'];
+    if ((int)($f['size'] ?? 0) > $max_bytes) return ['ok' => 0, 'message' => '图片不能超过 ' . (int)round($max_bytes / 1048576) . 'MB'];
+    $tmp = (string)($f['tmp_name'] ?? '');
+    if ($tmp === '' || !is_uploaded_file($tmp)) return ['ok' => 0, 'message' => '非法的上传文件'];
+    $info = @getimagesize($tmp);
+    $ext = $info === false ? false : array_search((string)$info['mime'], imgbed_mimes(), true);
+    if ($ext === false) return ['ok' => 0, 'message' => '仅支持 PNG / JPG / GIF / WebP 格式图片'];
+
+    $orig_name = imgbed_clean_name((string)($f['name'] ?? 'image'));
+    [$bytes, $ext, $note] = imgbed_process($tmp, (string)$ext, $cfg);
+    $mime = imgbed_mimes()[$ext] ?? 'application/octet-stream';
+    $key = imgbed_build_key($cfg, $ext);
+    [$ok, $err] = imgbed_store($cfg, 'PUT', $key, $mime, $bytes);
+    if (!$ok) return ['ok' => 0, 'message' => '上传图床失败' . ($err !== '' ? '：' . $err : '')];
+
+    $url = imgbed_public_url($cfg, $key);
+    // R2 默认（S3 API）端点不允许匿名读取，未配置访问域名时提前给出提示。
+    if ($note === '' && $cfg['source'] === 'r2' && $cfg['url_prefix'] === '') {
+        $note = '未配置访问域名：R2 默认端点不支持匿名访问，图片链接可能无法显示，请到「后台 → 图床 → 设置」填写自定义域名 / r2.dev 域名';
+    }
+    q('INSERT INTO plugin_imgbed_files(user_id,name,store_key,url,mime,source,size,created_at) VALUES(?,?,?,?,?,?,?,?)',
+        [uid(), $orig_name, $key, $url, $mime, $cfg['source'], strlen($bytes), now()]);
+    return ['ok' => 1, 'url' => $url, 'name' => $orig_name, 'note' => $note];
 }
 
 // --- 上传路由（写文章页 AJAX，need_admin + CSRF 由核心统一校验）---
@@ -415,33 +479,7 @@ function imgbed_upload_route(array $plugin): void
     need_admin();
     require_post();
     try {
-        $cfg = imgbed_config();
-        if (!imgbed_ready($cfg)) json_response(['ok' => 0, 'message' => '图床尚未配置完成，请到「后台 → 图床 → 设置」填写凭据']);
-        $f = $_FILES['file'] ?? null;
-        if (!is_array($f) || (int)($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) json_response(['ok' => 0, 'message' => '未收到上传文件']);
-        if ((int)$f['error'] !== UPLOAD_ERR_OK) json_response(['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）']);
-        if ((int)($f['size'] ?? 0) > 10 * 1024 * 1024) json_response(['ok' => 0, 'message' => '图片不能超过 10MB']);
-        $tmp = (string)($f['tmp_name'] ?? '');
-        if ($tmp === '' || !is_uploaded_file($tmp)) json_response(['ok' => 0, 'message' => '非法的上传文件']);
-        $info = @getimagesize($tmp);
-        $ext = $info === false ? false : array_search((string)$info['mime'], imgbed_mimes(), true);
-        if ($ext === false) json_response(['ok' => 0, 'message' => '仅支持 PNG / JPG / GIF / WebP 格式图片']);
-
-        $orig_name = imgbed_clean_name((string)($f['name'] ?? 'image'));
-        [$bytes, $ext, $note] = imgbed_process($tmp, (string)$ext, $cfg);
-        $mime = imgbed_mimes()[$ext] ?? 'application/octet-stream';
-        $key = imgbed_build_key($cfg, $ext);
-        [$ok, $err] = imgbed_store($cfg, 'PUT', $key, $mime, $bytes);
-        if (!$ok) json_response(['ok' => 0, 'message' => '上传图床失败' . ($err !== '' ? '：' . $err : '')]);
-
-        $url = imgbed_public_url($cfg, $key);
-        // R2 默认（S3 API）端点不允许匿名读取，未配置访问域名时提前给出提示。
-        if ($note === '' && $cfg['source'] === 'r2' && $cfg['url_prefix'] === '') {
-            $note = '未配置访问域名：R2 默认端点不支持匿名访问，图片链接可能无法显示，请到「后台 → 图床 → 设置」填写自定义域名 / r2.dev 域名';
-        }
-        q('INSERT INTO plugin_imgbed_files(user_id,name,store_key,url,mime,source,size,created_at) VALUES(?,?,?,?,?,?,?,?)',
-            [uid(), $orig_name, $key, $url, $mime, $cfg['source'], strlen($bytes), now()]);
-        json_response(['ok' => 1, 'url' => $url, 'name' => $orig_name, 'note' => $note]);
+        json_response(imgbed_handle_upload(is_array($_FILES['file'] ?? null) ? $_FILES['file'] : []));
     } catch (\Throwable $e) {
         error_log('[Mono imgbed] upload: ' . $e->getMessage());
         json_response(['ok' => 0, 'message' => '上传失败，请查看站点错误日志']);
@@ -468,6 +506,19 @@ function imgbed_write_inject(string $value, array $ctx): string
         error_log('[Mono imgbed] inject: ' . $e->getMessage());
         return $value;
     }
+}
+
+// 删除一条上传记录：按记录中的存储源删除远端对象（配置切换过源也能清理旧对象），再删本地记录。
+// 跨插件可复用（如动态插件删除含图床图片的动态时）。返回 [ok, err]。
+function imgbed_delete_file(int $id): array
+{
+    $file = one('SELECT * FROM plugin_imgbed_files WHERE id=?', [$id]);
+    if (!$file) return [false, '记录不存在'];
+    $cfg = imgbed_config();
+    if (isset(imgbed_sources()[(string)$file['source']])) $cfg['source'] = (string)$file['source'];
+    [$ok, $err] = imgbed_store($cfg, 'DELETE', (string)$file['store_key'], (string)$file['mime'], null);
+    q('DELETE FROM plugin_imgbed_files WHERE id=?', [$id]);
+    return [$ok, $err];
 }
 
 // --- 后台：常驻「图床」标签 + 配置子页 ---
@@ -538,19 +589,21 @@ function imgbed_admin(array $plugin): string
                     [$ok, $msg] = imgbed_test(imgbed_config());
                     set_flash(($ok ? '设置已保存；连通测试通过：' : '设置已保存；连通测试失败：') . $msg, $ok ? 'ok' : 'error');
                 } else {
-                    set_flash('图床设置已保存');
+                    // 保存即预创建 WebDAV「地址」目录链；失败不阻断（首次上传时仍有逐级建目录 + 重试兑底）。
+                    $note = '';
+                    $saved = imgbed_config();
+                    if ($saved['source'] === 'webdav' && imgbed_ready($saved)) {
+                        [$pok, $pwhy] = imgbed_webdav_ensure($saved);
+                        $note = $pok ? '，WebDAV 目录已确认就绪' : '；WebDAV 目录预创建未完成（' . $pwhy . '），首次上传时会自动重试';
+                    }
+                    set_flash('图床设置已保存' . $note);
                 }
                 go($back);
             }
             if ($action === 'delete' && $from_tab) {
                 $id = (int)($_POST['id'] ?? 0);
-                $file = one('SELECT * FROM plugin_imgbed_files WHERE id=?', [$id]);
-                if ($file) {
-                    // 用记录中的存储源删除（配置切换过源也能清理旧对象）。
-                    $cfg = imgbed_config();
-                    if (isset(imgbed_sources()[(string)$file['source']])) $cfg['source'] = (string)$file['source'];
-                    [$ok, $err] = imgbed_store($cfg, 'DELETE', (string)$file['store_key'], (string)$file['mime'], null);
-                    q('DELETE FROM plugin_imgbed_files WHERE id=?', [$id]);
+                if (one('SELECT id FROM plugin_imgbed_files WHERE id=?', [$id])) {
+                    [$ok, $err] = imgbed_delete_file($id);
                     set_flash($ok ? '图片已删除' : '本地记录已删除；远端对象删除失败（' . $err . '），可手动到图床控制台清理', $ok ? 'ok' : 'error');
                 }
                 go($back);
@@ -593,6 +646,98 @@ function imgbed_admin_list(): string
     return $html . paginate($total, $page, $per, fn(int $p): string => admin_url(['tab' => 'imgbed', 'page' => $p]));
 }
 
+// WebDAV 反代（Cloudflare Worker）代码与配置方法弹窗；转发地址按当前配置自动生成，代码内置根路径自检页。
+function imgbed_worker_dialog(array $cfg): string
+{
+    $target = rtrim($cfg['webdav']['base_url'], '/');
+    if ($target === '' || !preg_match('#^https?://#i', $target)) $target = 'https://你的WebDAV地址/子目录';
+    $target = str_replace(["'", "\r", "\n"], ['%27', '', ''], $target);
+    // Worker 代码内嵌根路径自检页；用占位符注入转发地址，nowdoc 避免 PHP 解析 JS 模板字符串。
+    $code = <<<'JS'
+// WebDAV 反代（Cloudflare Worker）：图片请求透传转发；访问根路径显示自检页。
+const TARGET = '__TARGET__';   // ← 你的 WebDAV 目录地址（本代码已按后台「地址」自动填入）
+
+const IT_WORKS = (env, state) => `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebDAV 反代自检 · It works!</title>
+<style>
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f9;color:#24292f;margin:0;padding:40px 16px}
+main{max-width:600px;margin:0 auto;background:#fff;border:1px solid #e4e6ea;border-radius:12px;padding:24px 28px}
+h1{font-size:19px;margin:0 0 6px}
+.sub{color:#8a919b;font-size:13px;margin:0 0 18px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:9px 0;border-top:1px solid #eef0f3;vertical-align:top;line-height:1.6}
+td:first-child{color:#8a919b;width:88px;white-space:nowrap}
+code{background:#f1f3f6;border-radius:4px;padding:1px 6px;font-size:12.5px;word-break:break-all}
+.ok{color:#1a7f37}.bad{color:#cf222e}
+.tip{margin:16px 0 0;padding-top:14px;border-top:1px solid #eef0f3;font-size:13px;color:#57606a;line-height:1.8}
+</style>
+</head>
+<body><main>
+<h1>✅ WebDAV 反代 · It works!</h1>
+<p class="sub">Worker 部署成功，正在运行。本提示页只出现在根路径，图片请求会原样转发。</p>
+<table>
+<tr><td>转发目标</td><td><code>${TARGET}</code></td></tr>
+<tr><td>环境变量</td><td>${env.U && env.P ? '<span class="ok">U / P 已配置</span>' : '<span class="bad">未配置 U / P</span>（Settings → Variables and Secrets 中添加）'}</td></tr>
+<tr><td>上游自检</td><td>${state}</td></tr>
+</table>
+<p class="tip">自检通过后，把本 Worker 域名填到博客后台「图床 → 访问域名」并保存。<br>若自检失败：先核对「转发目标」与后台「地址」是否完全一致，再检查 U / P 与 WebDAV 账号是否一致。</p>
+</main></body>
+</html>`;
+
+export default {
+  async fetch(req, env) {
+    const u = new URL(req.url);
+    const headers = env.U && env.P ? { Authorization: 'Basic ' + btoa(env.U + ':' + env.P) } : {};
+    // 根路径：返回自检提示页（不转发）。
+    if (u.pathname === '/') {
+      let state = '<span class="bad">未配置 U / P，无法探测上游</span>';
+      if (env.U && env.P) {
+        try {
+          const pr = await fetch(TARGET + '/', { headers });
+          if (pr.ok) state = '<span class="ok">✅ 上传目录可访问（上游 HTTP ' + pr.status + '）</span>';
+          else if (pr.status === 401) state = '<span class="bad">❌ 认证失败（HTTP 401）：U / P 与 WebDAV 账号不一致</span>';
+          else state = '<span class="bad">❌ 转发目标不可用（上游 HTTP ' + pr.status + '）：请核对「转发目标」与后台「地址」是否完全一致</span>';
+        } catch (e) {
+          state = '<span class="bad">❌ 无法连接转发目标：' + e + '</span>';
+        }
+      }
+      return new Response(IT_WORKS(env, state), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+    }
+    // 其余路径：转发到 WebDAV（图片读取 / 上传）。
+    const r = await fetch(TARGET + u.pathname, { headers });
+    const ok2xx = r.status >= 200 && r.status < 300;
+    return new Response(r.body, {
+      status: r.status,
+      headers: {
+        'content-type': r.headers.get('content-type') || 'application/octet-stream',
+        'cache-control': ok2xx ? 'public, max-age=31536000' : 'no-store',
+      },
+    });
+  },
+};
+JS;
+    $code = str_replace('__TARGET__', $target, $code);
+    return '<dialog class="imgbed-dialog" data-imgbed-dialog>'
+        . '<div class="imgbed-dialog-head"><strong>Cloudflare Worker 反代代码与配置方法</strong>'
+        . '<button type="button" class="imgbed-dialog-close" data-imgbed-dialog-close title="关闭">×</button></div>'
+        . '<div class="imgbed-dialog-body">'
+        . '<ol class="imgbed-steps">'
+        . '<li>登录 Cloudflare 控制台 → <b>Workers &amp; Pages</b> → 创建 Worker（免费计划即可）。</li>'
+        . '<li>进入 Worker 的 <b>Edit Code</b>，把下方代码整段粘贴覆盖后 <b>Deploy</b>。</li>'
+        . '<li>在 Worker 的 <b>Settings → Variables and Secrets</b> 添加两个变量：<code>U</code> = WebDAV 用户名、<code>P</code> = WebDAV 密码（类型建议选 Secret）。</li>'
+        . '<li>打开 Worker 域名根路径（如 <code>https://img-xxx.workers.dev/</code>），看到「✅ It works!」自检页且各项通过，说明反代可用。</li>'
+        . '<li>复制 Worker 域名填入本页「访问域名」并保存；再用无痕窗口打开测试连接给出的图片链接复核。</li>'
+        . '</ol>'
+        . '<div class="imgbed-code"><pre data-imgbed-code>' . h($code) . '</pre>'
+        . '<button type="button" class="btn sm ghost" data-imgbed-copy-code>复制代码</button></div>'
+        . '<p class="imgbed-dialog-note">转发地址已按你填写的「地址」自动生成；以后更换 WebDAV 地址需同步修改 Worker 代码。部署完成后打开 Worker 域名根路径，可看到「✅ It works!」自检页（转发目标 / 环境变量 / 上游探测结果）。访客经由 Worker 域名读取图片，凭据仅存于 Worker 环境变量。</p>'
+        . '</div></dialog>';
+}
+
 // 配置子页：存储源凭据 + 图片处理开关。
 function imgbed_admin_form(array $cfg): string
 {
@@ -626,14 +771,15 @@ function imgbed_admin_form(array $cfg): string
             . input('地址', 'webdav_base_url', $cfg['webdav']['base_url'], 'text', false, '如 https://dav.example.com/blog；子目录不存在时自动创建')
             . input('用户名', 'webdav_username', $cfg['webdav']['username'])
             . input('密码', 'webdav_password', '', 'password', false, $secret_help($cfg['webdav']['password'], ''))
-            . '</div>',
+            . '</div>'
+            . '<p class="imgbed-src-hint">多数公网网盘（InfiniCLOUD / TeraCloud 等）的 dav 路径强制认证、无法匿名直链：图片链接需自建反代（如 Cloudflare Worker）并把反代域名填入下方「访问域名」，否则访客打不开；自建公开 WebDAV（NAS / Alist 等）可忽略此提示。<a href="#" data-imgbed-dialog-open>查看反代代码与配置方法</a></p>',
     ];
     foreach ($blocks as $sid => $block) {
         $html .= '<div class="imgbed-src-block" data-imgbed-source="' . $sid . '"' . ($sid === $cfg['source'] ? '' : ' hidden') . '>' . $block . '</div>';
     }
 
     $html .= '<div class="imgbed-src-title">通用</div><div class="form-grid-2">'
-        . input('访问域名', 'url_prefix', $cfg['url_prefix'], 'text', false, '可选。自定义域名 / CDN，如 https://cdn.example.com；留空使用存储默认域名（R2 需自行配置公共访问）')
+        . input('访问域名', 'url_prefix', $cfg['url_prefix'], 'text', false, '可选。自定义域名 / CDN，如 https://cdn.example.com；留空使用存储默认域名（R2 需配公共域名 / r2.dev；WebDAV 多数网盘需填反代域名，否则图片访客打不开）')
         . input('路径前缀', 'path_prefix', $cfg['path_prefix'], 'text', false, '对象键前缀，默认 blog，只允许字母数字 / _ -')
         . '</div>'
         . checkbox('去除图片元数据（EXIF）', 'process_exif', $cfg['process_exif'], 'JPEG 按拍摄方向自动纠正并剥离 GPS 等隐私信息；GIF 跳过（避免丢失动画）')
@@ -651,8 +797,8 @@ function imgbed_admin_form(array $cfg): string
         . '<button class="btn" type="submit" name="imgbed_action" value="save">保存设置</button>'
         . '<button class="btn ghost" type="submit" name="imgbed_action" value="test">保存并测试连接</button>'
         . '</div>'
-        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「测试连接」会先保存当前表单，再向图床上传一张 1×1 探测图片并尽力删除，用于验证凭据与读写权限。对象键格式为 <code>路径前缀/年/月/16位随机名.扩展名</code>，不存在文件名冲突。</p>'
-        . '</form>';
+        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「测试连接」会先保存当前表单，再向图床上传一张 1×1 探测图片并尽力删除，用于验证凭据与读写权限。对象键格式为 <code>路径前缀/年/月/16位随机名.扩展名</code>，不存在文件名冲突。</p>';
+    $html .= imgbed_worker_dialog($cfg) . '</form>';
     return $html;
 }
 
@@ -679,6 +825,20 @@ function imgbed_css(): string
 .imgbed-open svg{display:block}
 .imgbed-open[disabled]{opacity:.55;cursor:default}
 .imgbed-src-title{font-weight:600;margin:16px 0 6px}
+.imgbed-src-hint{margin:8px 0 0;color:var(--text-subtle);font-size:var(--font-size-xs);line-height:1.6}
+.imgbed-src-hint a{color:var(--brand)}
+.imgbed-dialog{border:1px solid var(--border);border-radius:12px;padding:0;width:min(680px,calc(100vw - 32px));max-height:85vh;background:var(--background);color:var(--foreground)}
+.imgbed-dialog::backdrop{background:rgba(0,0,0,.45)}
+.imgbed-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);font-size:var(--font-size-md)}
+.imgbed-dialog-close{border:0;background:transparent;color:var(--text-subtle);font-size:18px;line-height:1;cursor:pointer}
+.imgbed-dialog-close:hover{color:var(--foreground)}
+.imgbed-dialog-body{padding:14px 16px;overflow:auto;max-height:calc(85vh - 50px)}
+.imgbed-steps{margin:0 0 12px;padding-left:20px;line-height:1.9;font-size:var(--font-size-sm)}
+.imgbed-steps code{padding:1px 5px;border:1px solid var(--border);border-radius:5px;background:var(--muted);font-size:12px}
+.imgbed-code{margin-bottom:10px}
+.imgbed-code pre{margin:0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--muted);overflow:auto;font-size:12px;line-height:1.6}
+.imgbed-code .btn{margin-top:8px}
+.imgbed-dialog-note{margin:0;color:var(--text-subtle);font-size:var(--font-size-xs);line-height:1.7}
 .imgbed-thumb{display:block;width:52px;height:52px;object-fit:cover;border:1px solid var(--border);border-radius:6px;background:var(--muted)}
 CSS;
 }
@@ -767,7 +927,34 @@ function imgbed_js(): string
     sel.addEventListener('change', apply);
     apply();
   }
-  function init() { bindUploader(); bindCopy(); bindSourceSwitch(); }
+  // 配置页：反代代码弹窗（打开 / 关闭 / 一键复制代码）。
+  function bindDialog() {
+    var dlg = document.querySelector('[data-imgbed-dialog]');
+    if (!dlg) return;
+    var close = function () { if (dlg.close) dlg.close(); else dlg.removeAttribute('open'); };
+    document.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+      if (t.closest('[data-imgbed-dialog-open]')) {
+        e.preventDefault();
+        if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+        return;
+      }
+      if (t.closest('[data-imgbed-dialog-close]')) { close(); return; }
+      var copy = t.closest('[data-imgbed-copy-code]');
+      if (!copy) return;
+      var codeEl = dlg.querySelector('[data-imgbed-code]');
+      var text = codeEl ? codeEl.textContent : '';
+      var flash = function () { var old = copy.textContent; copy.textContent = '已复制'; setTimeout(function () { copy.textContent = old; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(flash, function () { window.prompt('复制代码：', text); });
+      } else {
+        window.prompt('复制代码：', text);
+      }
+    });
+    dlg.addEventListener('click', function (e) { if (e.target === dlg) close(); });
+  }
+  function init() { bindUploader(); bindCopy(); bindSourceSwitch(); bindDialog(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 }());

@@ -11,9 +11,10 @@ if (!defined('APP_ROOT')) exit;
  *   支持续写 / 润色 / 排版 / 生成标签 / 自定义指令。
  * - admin_tabs ai：配置 provider、Base URL、API Key、模型（自动拉取 /models 列表供选择、
  *   可测试连通性），以及评论自动审核开关。
- * - cron review：按定时任务频率巡检待审核评论（任务最小间隔 60 秒；评论插件开启「先审后显」时），AI 判断
+ * - cron review：按定时任务频率巡检待审核评论（任务最小间隔 60 秒；评论插件开启「先审后显」时），
+ *   覆盖文章评论与动态评论（动态插件启用且评论开关开启，合计每轮上限），AI 判断
  *   通过 → status=1 公开展示；拒绝 → status=-1（保持不可见，后台仍可人工通过）。
- *   审核结论记录在 plugin_ai_reviews，供后台追溯。
+ *   审核结论记录在 plugin_ai_reviews（动态评论以 1e9 偏移的 id 区分），供后台追溯。
  *
  * 安全：所有 HTTP 调用仅在服务端进行（API Key 不出浏览器）；路由全部 need_admin + CSRF；
  * 回调内自行 try/catch，避免异常导致插件被核心自动停用。
@@ -290,6 +291,30 @@ function ai_review_context(array $cfg): array
     return [true, ''];
 }
 
+// 动态评论的审核门控：只在动态评论确实会产生待审时启用（与 moments 插件的判定条件保持一致）。
+function ai_moments_review_context(array $cfg): array
+{
+    if (!$cfg['review_enabled']) return [false, '自动审核未启用'];
+    if (!ai_ready($cfg)) return [false, 'AI 未配置完成'];
+    if (!isset(plugins()['moments'])) return [false, '动态插件未启用'];
+    if ((int)(plugin_config('moments', [])['comments_enabled'] ?? 1) !== 1) return [false, '动态评论已关闭'];
+    if ((int)val('SELECT enabled FROM app_plugins WHERE id=?', ['comment']) !== 1) return [false, '评论插件未启用'];
+    if (setting('allow_comment', '1') !== '1') return [false, '站点评论已关闭'];
+    if ((int)(plugin_config('comment', [])['moderate'] ?? 0) !== 1) return [false, '评论未开启「先审后显」'];
+    try {
+        q('SELECT id FROM plugin_moments_comments LIMIT 1');
+    } catch (\Throwable) {
+        return [false, '动态评论数据表不存在'];
+    }
+    return [true, ''];
+}
+
+// 动态评论在 plugin_ai_reviews.comment_id 中的取值 = 1e9 + 动态评论 id（避开与文章评论 id 的 UNIQUE 冲突）。
+function ai_moment_review_ref(int $id): int
+{
+    return 1000000000 + $id;
+}
+
 // 解析模型输出的审核结论：优先 JSON，失败时正则兜底。返回 [approved(bool), reason] 或 null。
 function ai_parse_verdict(string $text): ?array
 {
@@ -330,33 +355,89 @@ function ai_review_one(array $cfg, array $comment): ?array
     return ai_parse_verdict((string)$text);
 }
 
-// 巡检待审评论：通过 → status=1；拒绝 → status=-1（保持不可见，后台可人工复核）。
+// 单条动态评论送审：以所属动态的内容作为上下文（动态无标题）。成功返回 [approved, reason]，调用失败返回 null。
+function ai_review_moment_one(array $cfg, array $comment): ?array
+{
+    $moment = row('plugin_moments_moments', 'id', (int)$comment['moment_id']);
+    $body = trim((string)($moment['content'] ?? ''));
+    $default = '你是一个博客评论审核助手。请判断评论是否适合公开展示：拒绝垃圾广告、谩骂攻击、涉黄涉政涉暴、纯链接或无意义灌水；'
+        . '正常的讨论、提问、建议与友好互动应通过。拿不准时倾向拒绝。';
+    // 输出格式约束由系统统一追加，用户自定义提示词只需描述审核标准。
+    $sys = (trim($cfg['review_prompt']) !== '' ? trim($cfg['review_prompt']) : $default)
+        . ' 输出要求：只输出一个 JSON 对象，形如 {"approved": true, "reason": "一句话中文理由"}，不要输出任何其它内容；approved 为 true 表示通过展示，false 表示拒绝。';
+    $user = '动态内容：' . ($body !== '' ? cut($body, 200) : '（仅图片，无文字）') . "\n评论作者：" . (string)$comment['author'] . "\n评论内容：" . (string)$comment['content']
+        . "\n\n请只输出如下 JSON，不要输出其它任何内容：\n{\"approved\": true, \"reason\": \"一句话中文理由\"}\n"
+        . '其中 approved 为 true 表示通过展示，false 表示拒绝。';
+    [$ok, $text] = ai_chat($cfg, [['role' => 'system', 'content' => $sys], ['role' => 'user', 'content' => $user]], 0.2, 60);
+    if (!$ok) return null;
+    return ai_parse_verdict((string)$text);
+}
+
+// 巡检待审评论（文章 + 动态合计每轮上限）：通过 → status=1；拒绝 → status=-1（保持不可见，后台可人工复核）。
 function ai_review_pending(int $limit): array
 {
     $stats = ['checked' => 0, 'approved' => 0, 'rejected' => 0, 'failed' => 0, 'message' => ''];
     $cfg = ai_config();
-    [$ok, $why] = ai_review_context($cfg);
-    if (!$ok) { $stats['message'] = $why; return $stats; }
-    $rows = all('SELECT * FROM plugin_comment_comments WHERE status=0 ORDER BY id ASC LIMIT ' . max(1, min(20, $limit)));
-    foreach ($rows as $c) {
-        $stats['checked']++;
-        try {
-            $verdict = ai_review_one($cfg, $c);
-            if ($verdict === null) { $stats['failed']++; continue; }
-            app_db_upsert('plugin_ai_reviews', [
-                'comment_id' => (int)$c['id'],
-                'approved' => $verdict['approved'] ? 1 : 0,
-                'reason' => cut($verdict['reason'], 200),
-                'model' => $cfg['model'],
-                'created_at' => now(),
-            ], ['comment_id']);
-            q('UPDATE plugin_comment_comments SET status=? WHERE id=?', [$verdict['approved'] ? 1 : -1, (int)$c['id']]);
-            $verdict['approved'] ? $stats['approved']++ : $stats['rejected']++;
-        } catch (\Throwable $e) {
-            $stats['failed']++;
-            error_log('[Mono ai] review comment#' . (int)$c['id'] . ': ' . $e->getMessage());
+    $limit = max(1, min(20, $limit));
+    $whys = [];
+
+    // 文章评论（先审后显产生的待审）。
+    [$cok, $cwhy] = ai_review_context($cfg);
+    if ($cok) {
+        foreach (all('SELECT * FROM plugin_comment_comments WHERE status=0 ORDER BY id ASC LIMIT ' . $limit) as $c) {
+            $stats['checked']++;
+            try {
+                $verdict = ai_review_one($cfg, $c);
+                if ($verdict === null) { $stats['failed']++; continue; }
+                app_db_upsert('plugin_ai_reviews', [
+                    'comment_id' => (int)$c['id'],
+                    'approved' => $verdict['approved'] ? 1 : 0,
+                    'reason' => cut($verdict['reason'], 200),
+                    'model' => $cfg['model'],
+                    'created_at' => now(),
+                ], ['comment_id']);
+                q('UPDATE plugin_comment_comments SET status=? WHERE id=?', [$verdict['approved'] ? 1 : -1, (int)$c['id']]);
+                $verdict['approved'] ? $stats['approved']++ : $stats['rejected']++;
+            } catch (\Throwable $e) {
+                $stats['failed']++;
+                error_log('[Mono ai] review comment#' . (int)$c['id'] . ': ' . $e->getMessage());
+            }
         }
+    } else {
+        $whys[] = $cwhy;
     }
+
+    // 动态评论：受文章评论额度挤压，剩余额度内处理。
+    [$mok, $mwhy] = ai_moments_review_context($cfg);
+    if ($mok) {
+        $rest = $limit - $stats['checked'];
+        if ($rest > 0) {
+            foreach (all('SELECT * FROM plugin_moments_comments WHERE status=0 ORDER BY id ASC LIMIT ' . $rest) as $c) {
+                $stats['checked']++;
+                try {
+                    $verdict = ai_review_moment_one($cfg, $c);
+                    if ($verdict === null) { $stats['failed']++; continue; }
+                    app_db_upsert('plugin_ai_reviews', [
+                        'comment_id' => ai_moment_review_ref((int)$c['id']),
+                        'approved' => $verdict['approved'] ? 1 : 0,
+                        'reason' => cut($verdict['reason'], 200),
+                        'model' => $cfg['model'],
+                        'created_at' => now(),
+                    ], ['comment_id']);
+                    q('UPDATE plugin_moments_comments SET status=? WHERE id=?', [$verdict['approved'] ? 1 : -1, (int)$c['id']]);
+                    $verdict['approved'] ? $stats['approved']++ : $stats['rejected']++;
+                } catch (\Throwable $e) {
+                    $stats['failed']++;
+                    error_log('[Mono ai] review moment comment#' . (int)$c['id'] . ': ' . $e->getMessage());
+                }
+            }
+        }
+    } else {
+        $whys[] = $mwhy;
+    }
+
+    // 两个来源都不可用时才报「未执行」；只部分可用时正常执行并返回结果。
+    if (!$cok && !$mok) $stats['message'] = implode('；', array_unique($whys));
     return $stats;
 }
 
@@ -507,23 +588,27 @@ function ai_admin(array $plugin): string
         . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">保存时若 Base URL / Key 有变更或尚无模型列表，会自动请求一次模型列表；「测试连通性」会先保存当前表单，再向所选模型发一条极短对话验证。</p>'
         . '</form>';
 
-    // 评论自动审核设置（保存与手动执行合并为一张表单；自动化说明见下方 note）。
+    // 评论自动审核设置（文章 + 动态双来源；保存与手动执行合并为一张表单；自动化说明见下方 note）。
     [$ctx_ok, $ctx_why] = ai_review_context($cfg);
+    [$mctx_ok, $mctx_why] = ai_moments_review_context($cfg);
+    $ctx_notes = [];
+    if (!$ctx_ok) $ctx_notes[] = '文章评论：' . $ctx_why;
+    if (!$mctx_ok) $ctx_notes[] = '动态评论：' . $mctx_why;
     $html .= '<form method="post" style="margin-bottom:20px">' . form_token()
         . '<input type="hidden" name="admin_action" value="noop">'
-        . '<div style="font-weight:600;margin-bottom:6px">评论自动审核</div>'
+        . '<div style="font-weight:600;margin-bottom:6px">评论自动审核（文章 + 动态）</div>'
         . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin-top:0">'
-        . '在评论插件开启「先审后显」后，待审评论会被送 AI 判断：通过的评论公开展示；被拒绝的保持不可见，仍可在后台「评论」标签中人工通过；调用失败或返回无法解析时该评论保持待审，不会误删。'
-        . ($ctx_ok ? '' : ' <span style="color:var(--warning)">当前状态：' . h($ctx_why) . '，自动审核暂不会触发。</span>')
+        . '在评论插件开启「先审后显」后，待审评论会被送 AI 判断：通过的评论公开展示；被拒绝的保持不可见，仍可在后台「评论」/「动态」标签中人工通过；调用失败或返回无法解析时该评论保持待审，不会误删。'
+        . ($ctx_notes ? ' <span style="color:var(--warning)">当前状态：' . h(implode('；', $ctx_notes)) . '，对应来源的自动审核暂不会触发。</span>' : '')
         . '</p>'
         . checkbox('启用评论自动审核', 'review_enabled', $cfg['review_enabled'])
-        . input('每轮最多处理', 'review_limit', (string)$cfg['review_limit'], 'number', false, '每次执行最多处理的条数（1-20）；执行频率由定时任务决定，任务最短 60 秒一轮')
+        . input('每轮最多处理', 'review_limit', (string)$cfg['review_limit'], 'number', false, '每轮文章 + 动态合计最多处理的条数（1-20）；执行频率由定时任务决定，任务最短 60 秒一轮')
         . textarea('自定义审核提示词', 'review_prompt', $cfg['review_prompt'], false, '留空使用内置默认提示词。只需描述审核标准与尺度，JSON 输出格式由系统自动附加，无需在此约定', 'rows="3"')
         . '<div class="btn-row">'
         . '<button class="btn" type="submit" name="ai_action" value="save_review">保存审核设置</button>'
         . '<button class="btn ghost" type="submit" name="ai_action" value="review_now">立即审核待审评论</button>'
         . '</div>'
-        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「立即审核待审评论」会先保存当前设置，再立即执行一轮（处理条数同上），适合没有配置定时任务的站点。</p>'
+        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「立即审核待审评论」会先保存当前设置，再立即执行一轮（文章 + 动态合计处理条数同上），适合没有配置定时任务的站点。</p>'
         . '</form>';
 
     // 自动化说明：解释定时任务入口的含义、执行频率机制与两种配置方式（HTTP 地址含访问令牌）。
@@ -535,21 +620,54 @@ function ai_admin(array $plugin): string
         . '方式二（宝塔 / 1Panel 等面板添加「每分钟」的计划任务，或任何能定时发请求的服务；注意：下方地址已自动附带安全令牌，必须整体复制使用）：<code>* * * * * curl -s "' . h($cron_url) . '" &gt;/dev/null</code><br>'
         . '安全说明：HTTP 方式调用必须携带令牌（缺失或错误会返回 403）；令牌会随本页地址自动生成并展示，此前配置过旧地址的请替换为最新地址。没有条件配置定时任务时，用上面的「立即审核待审评论」手动执行完全等效。</div>';
 
-    // 审核记录（分页，20 条/页）。
+    // 审核记录（分页，20 条/页；标注来源：文章 / 动态）。
     $page = current_page();
     $per = 20;
     $total_reviews = 0;
+    $reviews = [];
     try {
         $total_reviews = (int)val('SELECT COUNT(*) FROM plugin_ai_reviews');
-        $reviews = all('SELECT r.*, c.author, c.content FROM plugin_ai_reviews r LEFT JOIN plugin_comment_comments c ON c.id=r.comment_id ORDER BY r.id DESC LIMIT ' . $per . ' OFFSET ' . (($page - 1) * $per));
+        $reviews = all('SELECT * FROM plugin_ai_reviews ORDER BY id DESC LIMIT ' . $per . ' OFFSET ' . (($page - 1) * $per));
     } catch (\Throwable) {
-        $reviews = [];
     }
     if ($reviews) {
-        $html .= '<div style="font-weight:600;margin:6px 0 8px">审核记录</div>';
-        $html .= '<table class="list"><thead><tr><th>评论</th><th>结论</th><th>理由</th><th>时间</th></tr></thead><tbody>';
+        // 批量补齐作者 / 内容：动态评论的 comment_id 带 1e9 偏移（见 ai_moment_review_ref），需回各自评论表查询。
+        $cids = [];
+        $mids = [];
         foreach ($reviews as $r) {
-            $html .= '<tr><td style="max-width:300px;color:var(--text-muted)">' . h(cut((string)($r['author'] ?? '—') . '：' . (string)($r['content'] ?? '（评论已删除）'), 46)) . '</td>'
+            $cid = (int)$r['comment_id'];
+            if ($cid >= 1000000000) $mids[] = $cid - 1000000000;
+            else $cids[] = $cid;
+        }
+        $cmap = [];
+        $mmap = [];
+        if ($cids) {
+            try {
+                foreach (all('SELECT id,author,content FROM plugin_comment_comments WHERE id IN (' . sql_marks(count($cids)) . ')', $cids) as $c) $cmap[(int)$c['id']] = $c;
+            } catch (\Throwable) {
+            }
+        }
+        if ($mids) {
+            try {
+                foreach (all('SELECT id,author,content FROM plugin_moments_comments WHERE id IN (' . sql_marks(count($mids)) . ')', $mids) as $c) $mmap[(int)$c['id']] = $c;
+            } catch (\Throwable) {
+            }
+        }
+        $html .= '<div style="font-weight:600;margin:6px 0 8px">审核记录</div>';
+        $html .= '<table class="list"><thead><tr><th>来源</th><th>评论</th><th>结论</th><th>理由</th><th>时间</th></tr></thead><tbody>';
+        foreach ($reviews as $r) {
+            $cid = (int)$r['comment_id'];
+            if ($cid >= 1000000000) {
+                $row = $mmap[$cid - 1000000000] ?? null;
+                $src = '动态';
+                $gone = '（动态评论已删除）';
+            } else {
+                $row = $cmap[$cid] ?? null;
+                $src = '文章';
+                $gone = '（评论已删除）';
+            }
+            $html .= '<tr><td>' . h($src) . '</td>'
+                . '<td style="max-width:300px;color:var(--text-muted)">' . h(cut($row ? (string)$row['author'] . '：' . (string)$row['content'] : $gone, 46)) . '</td>'
                 . '<td>' . ((int)$r['approved'] === 1 ? '<span class="badge">通过</span>' : '<span class="badge draft">拒绝</span>') . '</td>'
                 . '<td style="max-width:260px;color:var(--text-muted)">' . h((string)($r['reason'] ?? '')) . '</td>'
                 . '<td style="color:var(--text-subtle)">' . h(date('m-d H:i', (int)$r['created_at'])) . '</td></tr>';
@@ -852,8 +970,8 @@ JS;
 return [
     'id' => 'ai',
     'name' => 'AI 助手',
-    'version' => '1.2.0',
-    'description' => '接入 OpenAI 兼容接口：写文章页提供 AI 续写 / 润色 / 排版 / 自动生成标签，评论开启先审后显后可自动审核评论。',
+    'version' => '1.3.0',
+    'description' => '接入 OpenAI 兼容接口：写文章页提供 AI 续写 / 润色 / 排版 / 自动生成标签，评论开启先审后显后可自动审核文章与动态评论（动态需启用「动态」插件并开启其评论开关）。',
     'author' => 'Mono',
     'assets' => ['css' => 'ai_css', 'js' => 'ai_js'],
     'hooks' => ['page.before_render' => 'ai_write_inject'],

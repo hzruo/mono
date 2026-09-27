@@ -8,13 +8,17 @@ if (!defined('APP_ROOT')) exit;
  * - 导航新增「动态」入口（nav.menu_links 每页一次，非循环）。
  * - 页面顶部快捷发布框：文字（≤1000 字）+ 最多 9 张图片；默认需登录，可在后台关闭后允许游客填昵称发布。
  * - 点赞与评论复用配套插件：「文章点赞」启用时动态可点赞（身份语义一致：登录用 uid、游客用 IP 指纹）；
- *   「评论」启用时动态可评论，并继承其「需登录 / 先审后显」配置（管理员免审）。
- * - 图片存储 DATA_DIR/plugins/moments/，服务端命名 moment-<12hex>.<ext>，仅经输出路由访问（不暴露路径）。
- * - 后台「插件 → 动态」配置页：发布权限开关 + 待审评论列表（通过 / 删除）。
+ *   「评论」启用时动态可评论，并继承其「需登录 / 先审后显 / 楼中楼」配置（管理员免审）；动态评论可在后台单独开关。
+ * - 游客身份记忆：游客填过的昵称 / 邮箱存入 localStorage（与文章评论区共用 mono_guest_* key），有记忆即预填并折叠为一行摘要。
+ * - 待审自见：先审后显模式下，游客自己提交的待审评论仅本机可见（签名 cookie 记录，标「审核中」）；通过 / 拒绝后自动移出并清理记录。
+ * - 图片：图床插件（imgbed）启用且配置完成时直传图床（同步进图床管理列表，动态内存完整 URL）；
+ *   否则回退本地 DATA_DIR/plugins/moments/（服务端命名 moment-<12hex>.<ext>，仅经输出路由访问）。
+ * - 后台：顶部常驻「动态」标签为评论分页审核列表（通过 / 删除）；「插件 → 动态」配置页只保留设置
+ *   （发布权限 + 评论开关）。
  *
  * 性能：信息流一次取数，点赞数 / 已赞集合 / 评论 / 作者均为 IN 批量预取，渲染循环内零查询。
- * 安全：全部输出 h() 转义；POST 全 CSRF；上传 ≤5MB 且 getimagesize 白名单；删除需管理员；
- * 所有回调内 try/catch，避免异常导致插件被核心自动停用。
+ * 安全：全部输出 h() 转义；POST 全 CSRF；上传 ≤5MB 且 getimagesize 白名单；图床 URL 须存在于上传记录；
+ * 删除需管理员；所有回调内 try/catch，避免异常导致插件被核心自动停用。
  */
 
 // --- 配置与权限 ---
@@ -23,6 +27,7 @@ function moments_config(): array
     $raw = plugin_config('moments', []);
     return [
         'publish_require_login' => (int)($raw['publish_require_login'] ?? 1) === 1,
+        'comments_enabled' => (int)($raw['comments_enabled'] ?? 1) === 1,
     ];
 }
 
@@ -38,19 +43,20 @@ function moments_like_enabled(): bool
     return isset(plugins()['like']);
 }
 
-// 评论插件是否启用。
+// 动态评论是否可用：评论插件启用，且动态自身的评论开关开启。
 function moments_comment_enabled(): bool
 {
-    return isset(plugins()['comment']);
+    return isset(plugins()['comment']) && moments_config()['comments_enabled'];
 }
 
-// 继承评论插件的配置（跨插件不做函数调用，直读其持久化配置）。
+// 继承评论插件的配置（跨插件不做函数调用，直读其持久化配置；含楼中楼开关 nested）。
 function moments_comment_cfg(): array
 {
     $raw = plugin_config('comment', []);
     return [
         'require_login' => (int)($raw['require_login'] ?? 0) === 1,
         'moderate' => (int)($raw['moderate'] ?? 0) === 1,
+        'nested' => (int)($raw['nested'] ?? 0) === 1,
     ];
 }
 
@@ -84,28 +90,61 @@ function moments_mime(string $name): string
 
 function moments_img_url(string $name): string { return route_url('moments_img', ['f' => $name]); }
 
-// 过滤前端提交的图片名列表：白名单 + 文件存在 + 去重 + 上限 9 张。
+// 过滤前端提交的图片列表：本地文件名（白名单 + 文件存在）或图床 URL（须在图片记录中存在），去重 + 上限 9 张。
 function moments_filter_images(mixed $raw): array
 {
     $list = is_array($raw) ? $raw : (is_string($raw) ? plugin_json_decode($raw, []) : []);
     $out = [];
-    foreach ((array)$list as $name) {
-        if (!is_string($name) || !moments_valid_file($name)) continue;
-        if (!is_file(moments_dir() . '/' . $name)) continue;
-        if (in_array($name, $out, true)) continue;
-        $out[] = $name;
+    foreach ((array)$list as $item) {
+        if (!is_string($item) || $item === '' || in_array($item, $out, true)) continue;
+        if (str_contains($item, '://')) {
+            if (!moments_imgbed_url_exists($item)) continue;   // 图床 URL 防伪：必须是本图床的上传记录
+        } elseif (!moments_valid_file($item) || !is_file(moments_dir() . '/' . $item)) {
+            continue;
+        }
+        $out[] = $item;
         if (count($out) >= 9) break;
     }
     return $out;
 }
 
-// 尽力删除本地图片文件（失败不抛出）。
-function moments_delete_files(array $names): void
+// 图床 URL 是否来自本图床的上传记录（防外链注入；表不存在时视为无效）。
+function moments_imgbed_url_exists(string $url): bool
 {
-    foreach ($names as $name) {
-        if (!is_string($name) || !moments_valid_file($name)) continue;
-        $file = moments_dir() . '/' . $name;
+    try {
+        return (bool)val('SELECT COUNT(*) FROM plugin_imgbed_files WHERE url=?', [$url]);
+    } catch (\Throwable) {
+        return false;
+    }
+}
+
+// 尽力删除图片（失败不抛出）：本地文件直接删；图床 URL 交图床插件删远端对象并清理记录。
+function moments_delete_files(array $items): void
+{
+    foreach ($items as $item) {
+        if (!is_string($item) || $item === '') continue;
+        if (str_contains($item, '://')) {
+            moments_delete_imgbed_file($item);
+            continue;
+        }
+        if (!moments_valid_file($item)) continue;
+        $file = moments_dir() . '/' . $item;
         if (is_file($file)) @unlink($file);
+    }
+}
+
+// 删除图床图片：按 URL 找到上传记录，交给图床插件删除（远端对象 + 记录）；图床插件未启用时保留记录。
+function moments_delete_imgbed_file(string $url): void
+{
+    $ib = plugins()['imgbed'] ?? null;
+    if (!is_array($ib)) return;
+    try {
+        plugin_load($ib);
+        if (!function_exists('imgbed_delete_file')) return;
+        $row = one('SELECT id FROM plugin_imgbed_files WHERE url=?', [$url]);
+        if ($row) imgbed_delete_file((int)$row['id']);
+    } catch (\Throwable $e) {
+        error_log('[Mono moments] delete imgbed file: ' . $e->getMessage());
     }
 }
 
@@ -117,8 +156,20 @@ function moments_install(array $plugin): void
     app_db_create_index('idx_moments_created', 'plugin_moments_moments (created_at)');
     app_db_create_table('plugin_moments_likes', "id {$t['id']},moment_id {$t['uint']} NOT NULL,user_key {$t['key']} NOT NULL,created_at {$t['uint']} NOT NULL,UNIQUE (moment_id,user_key)");
     app_db_create_index('idx_moments_likes_moment', 'plugin_moments_likes (moment_id)');
-    app_db_create_table('plugin_moments_comments', "id {$t['id']},moment_id {$t['uint']} NOT NULL,author {$t['string']} NOT NULL,email {$t['string']},content {$t['text']} NOT NULL,status {$t['uint']} NOT NULL DEFAULT 1,created_at {$t['uint']} NOT NULL");
+    app_db_create_table('plugin_moments_comments', "id {$t['id']},moment_id {$t['uint']} NOT NULL,parent_id {$t['uint']} NOT NULL DEFAULT 0,author {$t['string']} NOT NULL,email {$t['string']},content {$t['text']} NOT NULL,status {$t['uint']} NOT NULL DEFAULT 1,created_at {$t['uint']} NOT NULL");
     app_db_create_index('idx_moments_comments_moment', 'plugin_moments_comments (moment_id,status,created_at)');
+    app_db_create_index('idx_moments_comments_parent', 'plugin_moments_comments (parent_id,status)');
+}
+
+// 表结构懒升级（幂等）：1.2.0 起新增楼中楼的 parent_id 列（跟随评论插件的 nested 模式）。
+// 插件文件升级不会自动重跑 install，故在渲染 / 提交 / 后台入口调用一次补齐；setting 标记后后续请求零成本跳过。
+function moments_upgrade_schema(): void
+{
+    if (setting('plugin_moments_schema', '1') === '2') return;
+    $t = app_db_types();
+    app_db_ensure_columns('plugin_moments_comments', ['parent_id' => $t['uint'] . ' NOT NULL DEFAULT 0']);
+    app_db_create_index('idx_moments_comments_parent', 'plugin_moments_comments (parent_id,status)');
+    save_settings_values(['plugin_moments_schema' => '2']);
 }
 
 function moments_uninstall(array $plugin, bool $keep_data = true): void
@@ -129,6 +180,7 @@ function moments_uninstall(array $plugin, bool $keep_data = true): void
     app_db_drop_index('idx_moments_likes_moment', 'plugin_moments_likes');
     app_db_drop_table('plugin_moments_likes');
     app_db_drop_index('idx_moments_comments_moment', 'plugin_moments_comments');
+    app_db_drop_index('idx_moments_comments_parent', 'plugin_moments_comments');
     app_db_drop_table('plugin_moments_comments');
     // 兜底清理图片目录中遗留的文件。
     foreach (glob(moments_dir() . '/moment-*') ?: [] as $file) {
@@ -147,7 +199,7 @@ function moments_nav_link(array $links, array $ctx): array
     return $links;
 }
 
-// --- 图片上传（发布框 AJAX）---
+// --- 图片上传（发布框 AJAX）：图床插件启用且配置完成时直传图床，否则本地存储。---
 function moments_upload_route(array $plugin): void
 {
     require_post();
@@ -155,6 +207,19 @@ function moments_upload_route(array $plugin): void
         $cfg = moments_config();
         if (!moments_can_publish($cfg)) json_response(['ok' => 0, 'message' => '请先登录后再上传图片']);
         $f = $_FILES['file'] ?? null;
+
+        // 图床直传：图片进入图床管理列表，动态里保存完整 URL；上传失败直接报错（不静默落本地）。
+        $ib = plugins()['imgbed'] ?? null;
+        if (is_array($ib)) {
+            plugin_load($ib);
+            if (function_exists('imgbed_ready') && imgbed_ready(imgbed_config())) {
+                $res = imgbed_handle_upload(is_array($f) ? $f : [], 5 * 1024 * 1024);
+                if ((int)($res['ok'] ?? 0) !== 1) json_response(['ok' => 0, 'message' => (string)($res['message'] ?? '图片上传失败')]);
+                json_response(['ok' => 1, 'file' => (string)$res['url'], 'url' => (string)$res['url']]);
+            }
+        }
+
+        // 本地存储（未启用图床或图床未配置完成）。
         if (!is_array($f) || (int)($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) json_response(['ok' => 0, 'message' => '未收到上传文件']);
         if ((int)$f['error'] !== UPLOAD_ERR_OK) json_response(['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）']);
         if ((int)($f['size'] ?? 0) > 5 * 1024 * 1024) json_response(['ok' => 0, 'message' => '图片不能超过 5MB']);
@@ -302,6 +367,7 @@ function moments_comment_route(array $plugin): void
 {
     require_post();
     if (!moments_comment_enabled()) err('评论功能未开启', 404);
+    moments_upgrade_schema();   // 老库（<1.2.0）补楼中楼 parent_id 列，幂等
     $id = (int)($_POST['id'] ?? 0);
     $back = route_url('moments') . '#moment-' . $id;
     try {
@@ -350,10 +416,22 @@ function moments_comment_route(array $plugin): void
             set_flash('请勿重复提交相同内容', 'error');
             go($back);
         }
+        // 楼中楼（跟随评论插件 nested 开关）：解析回复目标——必须是本动态的顶层评论；
+        // 目标是子回复时归位到所属楼层；非法（不存在 / 跨动态）则视为顶层评论。
+        $parent_id = (int)($_POST['parent_id'] ?? 0);
+        if ($parent_id > 0) {
+            $parent = one('SELECT id,moment_id,parent_id FROM plugin_moments_comments WHERE id=?', [$parent_id]);
+            if (!$parent || (int)$parent['moment_id'] !== $id) {
+                $parent_id = 0;
+            } elseif ((int)$parent['parent_id'] > 0) {
+                $parent_id = (int)$parent['parent_id'];
+            }
+        }
         $status = $cfg['moderate'] && !is_admin() ? 0 : 1;
-        q('INSERT INTO plugin_moments_comments(moment_id,author,email,content,status,created_at) VALUES(?,?,?,?,?,?)',
-            [$id, $author, $email, $content, $status, now()]);
-        set_flash($status === 1 ? '评论发表成功' : '评论已提交，等待审核');
+        q('INSERT INTO plugin_moments_comments(moment_id,parent_id,author,email,content,status,created_at) VALUES(?,?,?,?,?,?,?)',
+            [$id, $parent_id, $author, $email, $content, $status, now()]);
+        if ($status === 0) moments_mine_add(app_db_last_insert_id('plugin_moments_comments'));
+        set_flash($status === 1 ? '评论发表成功' : '评论已提交，审核中（仅你自己可见）');
         go($back);
     } catch (\Throwable $e) {
         error_log('[Mono moments] comment: ' . $e->getMessage());
@@ -402,6 +480,7 @@ function moments_publish_box(): string
 // 信息流：一次取数 + 点赞数 / 已赞集合 / 评论 / 作者四组 IN 批量预取，渲染内零查询。
 function moments_feed(): string
 {
+    moments_upgrade_schema();   // 老库（<1.2.0）补评论楼中楼的 parent_id 列，幂等
     $page = current_page();
     $per = 10;
     $total = (int)val('SELECT COUNT(*) FROM plugin_moments_moments');
@@ -527,57 +606,174 @@ function moments_card(array $r, array $ctx): string
     return $html . '</article>';
 }
 
-// 九宫格图片（点击走灯箱，href 兜底可直接打开）。
-function moments_image_grid(array $names): string
+// 九宫格图片（点击走灯箱，href 兜底可直接打开）；兼容本地文件与图床 URL。
+function moments_image_grid(array $items): string
 {
-    $names = array_values(array_filter($names, static fn(mixed $n): bool => is_string($n) && moments_valid_file($n)));
-    if (!$names) return '';
-    $html = '<div class="moments-imgs n' . count($names) . '">';
-    foreach ($names as $name) {
-        $url = moments_img_url($name);
+    $items = array_values(array_filter($items, static fn(mixed $n): bool => is_string($n) && $n !== '' && (str_contains($n, '://') || moments_valid_file($n))));
+    if (!$items) return '';
+    $html = '<div class="moments-imgs n' . count($items) . '">';
+    foreach ($items as $item) {
+        $url = str_contains($item, '://') ? $item : moments_img_url($item);
         $html .= '<a class="moments-img" href="' . h($url) . '" data-moments-lightbox><img src="' . h($url) . '" alt="" loading="lazy"></a>';
     }
     return $html . '</div>';
 }
 
-// 评论区：已审评论平铺展示 + 发表表单（游客字段与需登录提示按 comment 插件配置）。
+// --- 我的待审评论（本机可见）---
+// 与文章评论区同构：签名 cookie 记住自己提交的动态评论 id，仅展示仍待审（status=0）的；
+// 通过（1）/ 拒绝（-1）后自动移出并清理记录；cookie：mono_mine_moment。
+function moments_mine_token(int $id): string
+{
+    return substr(hash_hmac('sha256', 'moment:' . $id, csrf_token()), 0, 16);
+}
+function moments_mine_ids(): array
+{
+    $raw = (string)($_COOKIE['mono_mine_moment'] ?? '');
+    $ids = [];
+    foreach (explode(',', $raw) as $pair) {
+        $parts = explode('.', $pair, 2);
+        if (count($parts) !== 2 || !preg_match('/^[a-f0-9]{16}$/', $parts[1])) continue;
+        $id = (int)$parts[0];
+        if ($id > 0 && hash_equals(moments_mine_token($id), $parts[1])) $ids[$id] = true;
+    }
+    return $ids;
+}
+function moments_mine_write(array $ids): void
+{
+    if (headers_sent()) return;
+    if (!$ids) {
+        app_cookie('mono_mine_moment', '', time() - 3600);
+        return;
+    }
+    $pairs = [];
+    foreach (array_keys($ids) as $id) $pairs[] = $id . '.' . moments_mine_token((int)$id);
+    app_cookie('mono_mine_moment', implode(',', $pairs), time() + 2592000);   // 30 天
+}
+function moments_mine_add(int $id): void
+{
+    $ids = moments_mine_ids();
+    $ids[$id] = true;
+    moments_mine_write(array_slice($ids, -20, null, true));
+}
+// 渲染某条动态下「我的待审评论」区块（独立于正常两层 / 平铺列表，永不重复显示）。
+function moments_mine_html(int $moment_id): string
+{
+    $ids = moments_mine_ids();
+    if (!$ids) return '';
+    $keys = array_map('intval', array_keys($ids));
+    $rows = all('SELECT * FROM plugin_moments_comments WHERE moment_id=? AND id IN (' . implode(',', $keys) . ') ORDER BY id ASC', [$moment_id]);
+    $seen = [];
+    $keep = [];
+    $items = '';
+    foreach ($rows as $c) {
+        $cid = (int)$c['id'];
+        $seen[$cid] = true;
+        if ((int)$c['status'] !== 0) continue;   // 审核已出结果：不再列为待审
+        $keep[$cid] = true;
+        $items .= moments_comment_item($c, 0, false, true);
+    }
+    $final = [];
+    foreach (array_keys($ids) as $id) {
+        if (!isset($seen[$id]) || isset($keep[$id])) $final[$id] = true;
+    }
+    if (array_diff_key($ids, $final)) moments_mine_write($final);   // 惰性清理
+    if ($items === '') return '';
+    return '<div class="moments-mine"><div class="moments-mine-note">以下是你提交的评论，正在审核中——通过后对所有人公开，目前仅你自己可见。</div>' . $items . '</div>';
+}
+
+// 渲染单条动态评论。$reply_id 为点击「回复」时的目标楼层（楼中楼模式下为顶层评论 id）；$pending 为待审条目（仅本人可见）。
+function moments_comment_item(array $c, int $reply_id, bool $nested, bool $pending = false): string
+{
+    $cts = (int)$c['created_at'];
+    $html = '<div class="moments-comment">'
+        . '<span class="moments-comment-name">' . h((string)$c['author']) . '：</span>'
+        . '<span class="moments-comment-text">' . nl2br(h((string)$c['content'])) . '</span>'
+        . '<span class="moments-comment-time" title="' . h(date('Y-m-d H:i', $cts)) . '">' . h(human_time($cts)) . '</span>';
+    if ($pending) $html .= '<span class="moments-mine-tag">审核中</span>';
+    if ($nested && !$pending) {
+        $html .= '<button type="button" class="moments-comment-reply" data-reply="' . h((string)$c['author']) . '" data-reply-id="' . $reply_id . '">回复</button>';
+    }
+    return $html . '</div>';
+}
+
+// 评论区：已审评论展示（楼中楼开关跟随评论插件——开启为两层嵌套，关闭为平铺）+ 发表表单。
 function moments_comment_block(int $id, array $comments, array $cfg): string
 {
+    $nested = $cfg['nested'];
     $html = '<div class="moments-comments">';
-    foreach ($comments as $c) {
-        $cts = (int)$c['created_at'];
-        $html .= '<div class="moments-comment">'
-            . '<span class="moments-comment-name">' . h((string)$c['author']) . '</span>'
-            . '<span class="moments-comment-text">' . nl2br(h((string)$c['content'])) . '</span>'
-            . '<span class="moments-comment-time" title="' . h(date('Y-m-d H:i', $cts)) . '">' . h(human_time($cts)) . '</span></div>';
+    if ($nested) {
+        // 两层结构：顶层评论 + 其下回复（数据层已保证回复的 parent_id 指向顶层楼层）；
+        // 父楼已不可见的孤儿回复兜底按顶层展示，避免数据漂移导致内容永久隐藏。
+        $root_ids = [];
+        foreach ($comments as $c) {
+            if ((int)($c['parent_id'] ?? 0) === 0) $root_ids[(int)$c['id']] = true;
+        }
+        $roots = [];
+        $children = [];
+        foreach ($comments as $c) {
+            $pid = (int)($c['parent_id'] ?? 0);
+            if ($pid > 0 && isset($root_ids[$pid])) $children[$pid][] = $c;
+            else $roots[] = $c;
+        }
+        foreach ($roots as $c) {
+            $cid = (int)$c['id'];
+            $html .= '<div class="moments-comment-thread">' . moments_comment_item($c, $cid, true);
+            if (!empty($children[$cid])) {
+                $html .= '<div class="moments-comment-children">';
+                foreach ($children[$cid] as $cc) $html .= moments_comment_item($cc, $cid, true);
+                $html .= '</div>';
+            }
+            $html .= '</div>';
+        }
+    } else {
+        foreach ($comments as $c) $html .= moments_comment_item($c, 0, false);
     }
+    // 我的待审评论（仅提交者本机可见；通过 / 拒绝后自动移出并清理记录）。
+    $html .= moments_mine_html($id);
     $me = me();
     if (!$me && $cfg['require_login']) {
         return $html . '<p class="moments-login-inline">评论需登录后发表，<a href="' . h(route_url('login')) . '">去登录</a></p></div>';
     }
     $html .= '<form class="moments-comment-form" method="post" action="' . h(route_url('moments_comment')) . '">' . form_token()
-        . '<input type="hidden" name="id" value="' . $id . '">';
+        . '<input type="hidden" name="id" value="' . $id . '">'
+        . ($nested ? '<input type="hidden" name="parent_id" value="0">' : '');
     if (!$me) {
-        $html .= '<div class="moments-comment-fields">'
+        $html .= '<div class="moments-comment-fields" data-guest-fields>'
+            . '<div class="moments-comment-inputs">'
             . '<input type="text" name="author" maxlength="40" placeholder="昵称" required>'
             . '<input type="email" name="email" maxlength="150" placeholder="邮箱（可选）">'
+            . '</div>'
+            . '<div class="moments-guest-remember">以 <b class="moments-guest-remember-name"></b> 的身份评论<button type="button" class="moments-guest-edit" data-guest-edit>修改</button></div>'
             . '</div>';
     }
-    $html .= '<div class="moments-comment-input"><textarea name="content" rows="1" maxlength="1000" placeholder="友好评论…" required></textarea>'
+    $html .= ($nested ? '<div class="moments-reply-hint" hidden>正在回复 <b class="moments-reply-hint-name"></b><button type="button" class="moments-reply-cancel" data-reply-cancel>取消</button></div>' : '')
+        . '<div class="moments-comment-input"><textarea name="content" rows="1" maxlength="1000" placeholder="友好评论…" required></textarea>'
         . '<button class="btn sm" type="submit">评论</button></div></form>';
     return $html . '</div>';
 }
 
-// --- 后台（plugins&view=moments）：发布权限配置 + 待审评论 ---
+// 后台「动态」标签：启用后出现在后台导航，直达评论分页审核列表（与 admin_tabs 子页共用回调）。
+function moments_admin_tabs(array $tabs, array $ctx): array
+{
+    $tabs['moments'] = '动态';
+    return $tabs;
+}
+
+// 后台动态管理（双入口共用）：
+// - 「动态」标签（?a=admin&tab=moments）：评论分页审核列表，行内「通过 / 删除」。
+// - 「插件 → 动态」配置（?a=admin&tab=plugins&view=moments）：只显示插件设置。
 function moments_admin(array $plugin): string
 {
     try {
-        $back = admin_url(['tab' => 'plugins', 'view' => 'moments']);
+        moments_upgrade_schema();   // 老库（<1.2.0）补评论楼中楼的 parent_id 列，幂等
+        $from_tab = (string)($_GET['tab'] ?? '') === 'moments';
+        $back = $from_tab ? admin_url(['tab' => 'moments']) : admin_url(['tab' => 'plugins', 'view' => 'moments']);
         if (is_post_request()) {
             $action = (string)($_POST['moments_action'] ?? '');
             if ($action === 'save') {
                 plugin_save_config('moments', [
                     'publish_require_login' => (int)($_POST['publish_require_login'] ?? 0) === 1 ? 1 : 0,
+                    'comments_enabled' => (int)($_POST['comments_enabled'] ?? 0) === 1 ? 1 : 0,
                 ]);
                 set_flash('动态设置已保存');
                 go($back);
@@ -588,39 +784,62 @@ function moments_admin(array $plugin): string
                 go($back);
             }
             if ($action === 'delete_comment') {
-                q('DELETE FROM plugin_moments_comments WHERE id=?', [(int)($_POST['id'] ?? 0)]);
+                $cid = (int)($_POST['id'] ?? 0);
+                q('DELETE FROM plugin_moments_comments WHERE id=? OR parent_id=?', [$cid, $cid]);   // 顶层删除连带其下回复
                 set_flash('评论已删除');
                 go($back);
             }
         }
-        return moments_admin_html();
+        return $from_tab ? moments_admin_list() : moments_admin_form();
     } catch (\Throwable $e) {
         error_log('[Mono moments] admin: ' . $e->getMessage());
         return '<p style="color:var(--danger)">动态后台渲染失败：' . h($e->getMessage()) . '</p>';
     }
 }
 
-function moments_admin_html(): string
+// 「插件 → 动态」配置页：插件设置；评论列表与审核在后台「动态」标签。
+function moments_admin_form(): string
 {
     $cfg = moments_config();
     $html = '<form method="post" style="margin-bottom:16px">' . form_token()
         . '<input type="hidden" name="admin_action" value="noop">'
         . '<input type="hidden" name="moments_action" value="save">'
         . checkbox('发布动态需登录', 'publish_require_login', $cfg['publish_require_login'], '关闭后游客填写昵称即可发布动态与图片')
+        . checkbox('开启动态评论', 'comments_enabled', $cfg['comments_enabled'], '需先启用「评论」插件；关闭后动态页隐藏评论区（历史评论保留，不受影响）')
         . '<button class="btn" type="submit">保存设置</button></form>';
-    $html .= '<div class="btn-row" style="margin-bottom:4px"><a class="btn sm ghost" href="' . h(route_url('moments')) . '">查看动态页</a></div>';
 
-    if (!moments_comment_enabled()) {
-        return $html . '<div class="note">评论插件未启用：动态页不显示评论区，也没有待审评论。</div>';
+    $html .= '<div class="note" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><span>';
+    if (!isset(plugins()['comment'])) {
+        $html .= '评论插件未启用：动态页不显示评论区，也没有待审评论。';
+    } elseif (!$cfg['comments_enabled']) {
+        $html .= '动态评论已关闭：动态页不显示评论区，历史评论保留。';
+    } else {
+        $pending = (int)val('SELECT COUNT(*) FROM plugin_moments_comments WHERE status=0');
+        $html .= '评论列表与「通过 / 删除」审核操作在后台顶部「动态」标签，本页只保留插件设置。'
+            . ($pending > 0 ? '当前有 ' . $pending . ' 条待审评论。' : '');
     }
-    $count = (int)val('SELECT COUNT(*) FROM plugin_moments_comments WHERE status=0');
-    $pending = all('SELECT * FROM plugin_moments_comments WHERE status=0 ORDER BY id ASC LIMIT 100');
-    $html .= '<div class="moments-admin-title">待审评论（' . $count . '）</div>';
-    if (!$pending) {
-        return $html . '<p class="moments-empty">暂无待审评论。评论插件开启「先审后显」后，游客评论会进入这里。</p>';
+    $html .= '</span><span style="display:inline-flex;gap:8px">'
+        . '<a class="btn sm ghost" href="' . h(route_url('moments')) . '">查看动态页</a>'
+        . '<a class="btn sm ghost" href="' . h(admin_url(['tab' => 'moments'])) . '">前往动态管理</a>'
+        . '</span></div>';
+    return $html;
+}
+
+// 「动态」标签：评论分页审核列表（20 条/页，与「评论」标签一致的排序：拒绝 / 待审在前）。
+function moments_admin_list(): string
+{
+    $page = current_page();
+    $per = 20;
+    $total = (int)val('SELECT COUNT(*) FROM plugin_moments_comments');
+    $comments = all('SELECT * FROM plugin_moments_comments ORDER BY status ASC, created_at DESC LIMIT ' . $per . ' OFFSET ' . (($page - 1) * $per));
+    $html = '<div class="btn-row" style="justify-content:flex-end;margin-bottom:10px">'
+        . '<a class="btn sm ghost" href="' . h(admin_url(['tab' => 'plugins', 'view' => 'moments'])) . '">动态设置</a></div>';
+    if (!$comments) {
+        return $html . '<p class="moments-empty">还没有动态评论。评论插件开启「先审后显」后，游客评论会进入这里等待审核。</p>';
     }
+    // 所属动态内容预览（IN 批量预取，渲染内零查询）。
     $moment_ids = [];
-    foreach ($pending as $c) $moment_ids[(int)$c['moment_id']] = true;
+    foreach ($comments as $c) $moment_ids[(int)$c['moment_id']] = true;
     $previews = [];
     if ($moment_ids) {
         $idlist = array_keys($moment_ids);
@@ -628,22 +847,27 @@ function moments_admin_html(): string
             $previews[(int)$m['id']] = trim((string)$m['content']);
         }
     }
-    $html .= '<table class="list"><thead><tr><th>作者</th><th>内容</th><th>所属动态</th><th>时间</th><th class="actions">操作</th></tr></thead><tbody>';
-    foreach ($pending as $c) {
+    $html .= '<table class="list"><thead><tr><th>作者</th><th>内容</th><th>所属动态</th><th>状态</th><th>时间</th><th class="actions">操作</th></tr></thead><tbody>';
+    foreach ($comments as $c) {
         $mid = (int)$c['moment_id'];
+        $status = (int)$c['status'];
         $preview = $previews[$mid] ?? '';
+        $badge = $status === 1 ? '<span class="badge">已显示</span>' : ($status === 0 ? '<span class="badge draft">待审</span>' : '<span class="badge draft">已拒绝</span>');
         $html .= '<tr><td>' . h((string)$c['author']) . '</td>'
-            . '<td style="max-width:280px">' . h(cut((string)$c['content'], 40)) . '</td>'
+            . '<td style="max-width:280px">' . ((int)($c['parent_id'] ?? 0) > 0 ? '<span class="badge">回复</span> ' : '') . h(cut((string)$c['content'], 40)) . '</td>'
             . '<td><a href="' . h(route_url('moments') . '#moment-' . $mid) . '">' . h($preview !== '' ? cut($preview, 16) : '动态 #' . $mid) . '</a></td>'
+            . '<td>' . $badge . '</td>'
             . '<td style="color:var(--text-subtle)">' . h(date('Y-m-d H:i', (int)$c['created_at'])) . '</td>'
-            . '<td class="actions"><div class="btn-row" style="justify-content:flex-end">'
-            . '<form method="post" style="display:inline">' . form_token() . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="moments_action" value="approve"><input type="hidden" name="id" value="' . (int)$c['id'] . '"><button class="btn sm" type="submit">通过</button></form>'
-            . '<form method="post" style="display:inline" data-confirm="删除这条评论？">' . form_token() . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="moments_action" value="delete_comment"><input type="hidden" name="id" value="' . (int)$c['id'] . '"><button class="btn sm danger" type="submit">删除</button></form>'
-            . '</div></td></tr>';
+            . '<td class="actions"><div class="btn-row" style="justify-content:flex-end">';
+        if ($status !== 1) {
+            $html .= '<form method="post" style="display:inline">' . form_token() . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="moments_action" value="approve"><input type="hidden" name="id" value="' . (int)$c['id'] . '"><button class="btn sm" type="submit">通过</button></form>';
+        }
+        $confirm_del = (int)($c['parent_id'] ?? 0) === 0 ? '删除这条评论？其下的回复将一并删除。' : '删除这条评论？';
+        $html .= '<form method="post" style="display:inline" data-confirm="' . $confirm_del . '">' . form_token() . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="moments_action" value="delete_comment"><input type="hidden" name="id" value="' . (int)$c['id'] . '"><button class="btn sm danger" type="submit">删除</button></form>';
+        $html .= '</div></td></tr>';
     }
     $html .= '</tbody></table>';
-    if ($count > count($pending)) $html .= '<p class="moments-empty">仅显示最早的 100 条，处理后可刷新继续。</p>';
-    return $html;
+    return $html . paginate($total, $page, $per, fn(int $p): string => admin_url(['tab' => 'moments', 'page' => $p]));
 }
 
 // --- 资源（合并进 plugins.css / plugins.js）---
@@ -694,14 +918,34 @@ function moments_css(): string
 .moments-comment-hint{color:var(--text-subtle);font-size:var(--font-size-sm)}
 .moments-comments{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line);display:flex;flex-direction:column;gap:6px}
 .moments-comment{line-height:1.6;font-size:var(--font-size-sm);word-break:break-word;overflow-wrap:anywhere}
-.moments-comment-name{font-weight:600;margin-right:6px;color:var(--text-muted)}
+.moments-comment-name{font-weight:600;margin-right:6px;color:var(--foreground)}
 .moments-comment-time{margin-left:8px;color:var(--text-subtle);font-size:var(--font-size-xs)}
+.moments-comment-thread{margin-bottom:2px}
+.moments-comment-children{margin:4px 0 2px 14px;padding-left:10px;border-left:2px solid var(--line);display:flex;flex-direction:column;gap:4px}
+.moments-comment-reply{border:0;background:transparent;padding:0 4px;margin-left:4px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
+.moments-comment-reply:hover{color:var(--brand);background:var(--brand-soft)}
+.moments-reply-hint{display:flex;align-items:center;gap:6px;margin:0 0 6px;font-size:var(--font-size-xs);color:var(--text-subtle)}
+.moments-reply-hint b{color:var(--brand);font-weight:600}
+.moments-reply-cancel{border:0;background:transparent;padding:0 2px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
+.moments-reply-cancel:hover{color:var(--brand);background:var(--brand-soft)}
 .moments-login-inline{margin:2px 0 0;color:var(--text-subtle);font-size:var(--font-size-sm)}
 .moments-comment-form{margin-top:6px}
-.moments-comment-fields{display:flex;gap:8px;margin-bottom:8px}
+.moments-comment-fields{margin-bottom:8px}
+.moments-comment-inputs{display:flex;gap:8px}
+.moments-comment-fields.collapsed .moments-comment-inputs{display:none}
+.moments-guest-remember{display:none;align-items:center;gap:2px;font-size:var(--font-size-xs);color:var(--text-subtle)}
+.moments-comment-fields.collapsed .moments-guest-remember{display:flex}
+.moments-guest-remember b{color:var(--brand);font-weight:600}
+.moments-guest-edit{border:0;background:transparent;padding:0 4px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
+.moments-guest-edit:hover{color:var(--brand);background:var(--brand-soft)}
 .moments-comment-fields input{flex:1;min-width:0;padding:7px 10px;border:1px solid var(--input);border-radius:8px;background:var(--background);color:var(--foreground);outline:none}
 .moments-comment-input{display:flex;gap:8px;align-items:flex-end}
 .moments-comment-input textarea{flex:1;min-height:38px;max-height:140px;padding:8px 10px;border:1px solid var(--input);border-radius:8px;background:var(--background);color:var(--foreground);line-height:1.5;resize:vertical;outline:none}
+/* 我的待审动态评论（仅提交者本机可见；通过 / 拒绝后自动移出，记录同步清理） */
+.moments-mine{margin:6px 0 8px;padding-top:6px;border-top:1px dashed var(--line)}
+.moments-mine-note{margin-bottom:2px;font-size:var(--font-size-xs);color:var(--text-subtle)}
+.moments-mine .moments-comment{opacity:.75}
+.moments-mine-tag{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:var(--font-size-xs);line-height:17px;color:var(--warning);background:color-mix(in oklab,var(--warning) 12%,transparent);border:1px solid color-mix(in oklab,var(--warning) 32%,transparent)}
 .moments-empty{margin:0;color:var(--text-muted)}
 .moments-admin-title{font-weight:600;margin:18px 0 8px}
 .moments-lightbox{position:fixed;inset:0;z-index:99;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.82);cursor:zoom-out}
@@ -806,6 +1050,93 @@ function moments_js(): string
     });
   }
 
+  // 楼中楼回复：点击「回复」→ 表单 parent_id 指向该楼层、显示可取消的提示条，并追加 @昵称。
+  function bindCommentReplies() {
+    document.addEventListener('click', function (e) {
+      var target = e.target;
+      if (!target || !target.closest) return;
+      var cancel = target.closest('[data-reply-cancel]');
+      if (cancel) {
+        var cform = cancel.closest('form');
+        if (cform) {
+          var chid = cform.querySelector('input[name="parent_id"]');
+          if (chid) chid.value = '0';
+          var chint = cform.querySelector('.moments-reply-hint');
+          if (chint) chint.hidden = true;
+        }
+        return;
+      }
+      var btn = target.closest('.moments-comment-reply');
+      if (!btn) return;
+      var section = btn.closest('.moments-comments');
+      if (!section) return;
+      var ta = section.querySelector('.moments-comment-input textarea');
+      if (!ta) return;
+      var name = btn.getAttribute('data-reply') || '';
+      if (!name) return;
+      var form = ta.closest('form');
+      var pid = btn.getAttribute('data-reply-id') || '';
+      if (form && pid) {
+        var hidden = form.querySelector('input[name="parent_id"]');
+        if (hidden) {
+          hidden.value = pid;
+          var hint = form.querySelector('.moments-reply-hint');
+          var hintName = form.querySelector('.moments-reply-hint-name');
+          if (hint) hint.hidden = false;
+          if (hintName) hintName.textContent = '@' + name;
+        }
+      }
+      var mention = '@' + name + ' ';
+      var v = ta.value;
+      if (v.slice(-mention.length) !== mention) {
+        ta.value = (v && v.slice(-1) !== ' ' ? v + ' ' : v) + mention;
+      }
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = ta.value.length;
+      if (ta.scrollIntoView) ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
+  // 游客身份记忆（与文章评论区共用同一对 key）：昵称 / 邮箱填过一次即自动预填，字段折叠为一行摘要（可展开修改）。
+  function guestGet(k) { try { return localStorage.getItem('mono_guest_' + k) || ''; } catch (err) { return ''; } }
+  function guestSet(k, v) { try { localStorage.setItem('mono_guest_' + k, v); } catch (err) {} }
+  function bindGuestFields() {
+    var wraps = document.querySelectorAll('[data-guest-fields]');
+    for (var i = 0; i < wraps.length; i++) bindGuest(wraps[i]);
+  }
+  function bindGuest(wrap) {
+    var form = wrap.closest('form');
+    if (!form) return;
+    var author = form.querySelector('input[name="author"]');
+    if (!author) return;
+    var email = form.querySelector('input[name="email"]');
+    var a = guestGet('author');
+    if (a && !author.value) author.value = a;
+    if (email) {
+      var em = guestGet('email');
+      if (em && !email.value) email.value = em;
+    }
+    var remember = wrap.querySelector('.moments-guest-remember');
+    var nameEl = wrap.querySelector('.moments-guest-remember-name');
+    if (a && remember) {
+      wrap.classList.add('collapsed');
+      if (nameEl) nameEl.textContent = a;
+    }
+    var edit = wrap.querySelector('[data-guest-edit]');
+    if (edit) edit.addEventListener('click', function () {
+      wrap.classList.remove('collapsed');
+      author.focus();
+    });
+    form.addEventListener('submit', function () {
+      var av = author.value.trim();
+      if (av) guestSet('author', av);
+      if (email) {
+        var ev = email.value.trim();
+        if (ev) guestSet('email', ev);
+      }
+    });
+  }
+
   // 图片灯箱：点击九宫格查看，点击任意处或 Esc 关闭。
   function bindLightbox() {
     var box = null;
@@ -830,7 +1161,7 @@ function moments_js(): string
     });
   }
 
-  function init() { bindPublisher(); bindLikes(); bindLightbox(); }
+  function init() { bindPublisher(); bindLikes(); bindCommentReplies(); bindGuestFields(); bindLightbox(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 }());
@@ -840,12 +1171,13 @@ JS;
 return [
     'id' => 'moments',
     'name' => '动态',
-    'version' => '1.0.0',
-    'description' => '微博式动态流：顶部快捷发布（文字 + 最多 9 张图片），朋友圈风格信息流；点赞与评论复用已启用的「文章点赞」「评论」插件，支持发布权限控制与评论审核。',
+    'version' => '1.3.0',
+    'description' => '微博式动态流：顶部快捷发布（文字 + 最多 9 张图片，启用图床后图片直传图床）；点赞与评论复用已启用的「文章点赞」「评论」插件，动态评论可单独开关并跟随其楼中楼模式，游客昵称 / 邮箱填过一次即自动预填，待审评论仅提交者本人可见（标「审核中」，通过 / 拒绝后自动隐藏）；支持发布权限控制、后台「动态」标签分页审核与 AI 自动审核。',
     'author' => 'Mono',
     'assets' => ['css' => 'moments_css', 'js' => 'moments_js'],
     'hooks' => [
         'nav.menu_links' => 'moments_nav_link',
+        'admin.tabs' => 'moments_admin_tabs',
     ],
     'routes' => [
         'moments' => 'moments_page_route',
