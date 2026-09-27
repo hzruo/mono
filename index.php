@@ -519,6 +519,8 @@ function default_settings(): array
         'excerpt_length' => '160',
         'allow_comment' => '1',
         'pretty_url' => '0',
+        'site_favicon' => '',
+        'site_logo' => '',
     ];
 }
 function settings_cache(): array
@@ -544,6 +546,38 @@ function save_settings_values(array $values): void
     foreach (array_keys($values) as $name) {
         if (str_starts_with((string)$name, 'plugin_') || (string)$name === 'cache_plugins') { plugin_runtime_cache_reset(); break; }
     }
+}
+
+// 站点图标（favicon / 站点 Logo）：文件落盘 DATA_DIR/site/<kind>.<ext>，设置项 site_<kind> 存扩展名（空=未设置）。
+function site_icon_dir(): string { return DATA_DIR . '/site'; }
+function site_icon_file(string $kind, string $ext): string { return site_icon_dir() . '/' . $kind . '.' . $ext; }
+function site_icon_mime(string $ext): string { return ['png' => 'image/png', 'jpg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'ico' => 'image/vnd.microsoft.icon'][$ext] ?? ''; }
+// 当前生效扩展名：设置值有效且文件存在才算已设置。
+function site_icon_ext(string $kind): string
+{
+    $ext = (string)setting('site_' . $kind, '');
+    return $ext !== '' && site_icon_mime($ext) !== '' && is_file(site_icon_file($kind, $ext)) ? $ext : '';
+}
+// 站点图标 URL：未设置返回空串（调用方回退默认展示）；带 mtime 指纹，换图立即刷新浏览器缓存。
+function site_icon_url(string $kind): string
+{
+    $ext = site_icon_ext($kind);
+    if ($ext === '') return '';
+    return append_url_query(route_url('site_icon', ['f' => $kind]), ['v' => (string)filemtime(site_icon_file($kind, $ext))]);
+}
+// 站点图标输出路由：?a=site_icon&f=favicon|logo（伪静态 /site_icon?f=...），不暴露真实路径。
+function site_icon_route(): void
+{
+    $kind = (string)($_GET['f'] ?? '');
+    if (!in_array($kind, ['favicon', 'logo'], true)) err('图标不存在', 404);
+    $ext = site_icon_ext($kind);
+    if ($ext === '') err('图标不存在', 404);
+    $file = site_icon_file($kind, $ext);
+    header('Content-Type: ' . site_icon_mime($ext));
+    header('Content-Length: ' . (string)filesize($file));
+    header('Cache-Control: public, max-age=86400');
+    readfile($file);
+    exit;
 }
 
 // --- 7. 插件运行时与 Hook 管道 ---
@@ -1007,6 +1041,13 @@ function paginate(int $total, int $page, int $size, callable $url_fn): string
 }
 
 // --- 14. 页面骨架渲染 ---
+// 浏览器标签页图标：自定义 favicon 优先，未设置回退内置 index.svg。
+function favicon_link_html(): string
+{
+    $ext = site_icon_ext('favicon');
+    if ($ext !== '') return '<link rel="icon" type="' . h(site_icon_mime($ext)) . '" href="' . h(site_icon_url('favicon')) . '">';
+    return '<link rel="icon" type="image/svg+xml" href="' . h(asset_url('app/assets/index.svg')) . '">';
+}
 function page_head_html(string $page_title, string $meta, string $head_extra = ''): string
 {
     return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
@@ -1015,7 +1056,7 @@ function page_head_html(string $page_title, string $meta, string $head_extra = '
         . '<script>(function(){var d=document.documentElement,s=null;try{s=localStorage.getItem("mono-theme")}catch(e){}var dark=s?s==="dark":(d.classList.contains("dark")||window.matchMedia("(prefers-color-scheme: dark)").matches);d.classList.toggle("dark",dark);var mq=window.matchMedia("(prefers-color-scheme: dark)"),f=function(e){var c=null;try{c=localStorage.getItem("mono-theme")}catch(e2){}if(!c)d.classList.toggle("dark",e.matches)};mq.addEventListener?mq.addEventListener("change",f):mq.addListener(f);})();</script>'
         . $meta
         . '<title>' . h($page_title) . '</title>'
-        . '<link rel="icon" type="image/svg+xml" href="' . h(asset_url('app/assets/index.svg')) . '">'
+        . favicon_link_html()
         . '<link rel="stylesheet" href="' . h(asset_url('app/assets/index.css')) . '?v=' . h(APP_VERSION) . '">'
         . plugin_asset_tag('css') . $head_extra . '</head><body>';
 }
@@ -1040,8 +1081,12 @@ function nav_menu_links(): array
 function page_nav_html(string $site_name): string
 {
     $active = (string)($_GET['a'] ?? 'home');
-    $mark = mb_substr($site_name !== '' ? $site_name : 'Mono', 0, 1, 'UTF-8');
-    $html = '<div class="top"><div class="bar"><a class="brand" href="' . h(route_url('home')) . '"><span class="brand-mark">' . h(mb_strtoupper($mark, 'UTF-8')) . '</span>' . h($site_name) . '</a>';
+    // 品牌图标：自定义 Logo 优先，未设置回退站名首字母方块。
+    $logo = site_icon_url('logo');
+    $brand_icon = $logo !== ''
+        ? '<img class="brand-logo" src="' . h($logo) . '" alt="">'
+        : '<span class="brand-mark">' . h(mb_strtoupper(mb_substr($site_name !== '' ? $site_name : 'Mono', 0, 1, 'UTF-8'), 'UTF-8')) . '</span>';
+    $html = '<div class="top"><div class="bar"><a class="brand" href="' . h(route_url('home')) . '">' . $brand_icon . h($site_name) . '</a>';
     $html .= '<nav class="nav" data-slot="nav.menu_links">';
     foreach (nav_menu_links() as $link) {
         $is_active = $link['url'] === route_url($active === 'home' ? 'home' : $active, $active === 'page' ? ['slug' => (string)($_GET['slug'] ?? '')] : []);
@@ -1652,6 +1697,7 @@ function core_routes(): array
         'logout' => 'logout_route',
         'rss' => 'rss_route',
         'avatar' => 'avatar_route',
+        'site_icon' => 'site_icon_route',
         'page' => 'page_page',
         'install' => [Setup::class, 'install_page'],
         'admin' => [Admin::class, 'route'],

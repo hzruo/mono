@@ -136,6 +136,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; line-height: 1.25; font-weight: 700; }
 .brand { display: inline-flex; align-items: center; gap: 8px; font-size: var(--font-size-lg); font-weight: 700; letter-spacing: -.03em; color: var(--foreground); text-decoration: none; }
 .brand:hover { color: var(--foreground); opacity: .75; }
 .brand-mark { width: 22px; height: 22px; border-radius: 6px; background: var(--primary); color: var(--primary-foreground); display: grid; place-items: center; font-size: 13px; font-weight: 800; }
+.brand-logo { width: 22px; height: 22px; border-radius: 6px; object-fit: cover; }
 .nav { display: flex; align-items: center; gap: 2px; flex: 1; }
 .nav-link { padding: 6px 12px; border-radius: calc(var(--radius) - 4px); color: var(--muted-foreground); font-size: var(--font-size-sm); font-weight: 500; text-decoration: none; transition: background-color .15s, color .15s; }
 .nav-link:hover { background: var(--accent); color: var(--accent-foreground); }

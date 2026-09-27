@@ -91,6 +91,9 @@ final class Admin
             // 「允许评论」仅评论插件启用时随表单提交；未启用时表单无此项，不写入以保留原值。
             if (isset(plugins()['comment'])) $values['allow_comment'] = (string)((int)($_POST['allow_comment'] ?? 0) === 1 ? 1 : 0);
             save_settings_values($values);
+            // 站点图标（favicon / 站点 Logo）：勾选「恢复默认」则删除，否则尝试保存新上传。
+            if ((int)($_POST['remove_favicon'] ?? 0) === 1) self::delete_site_icon('favicon'); else self::save_site_icon_upload('favicon');
+            if ((int)($_POST['remove_logo'] ?? 0) === 1) self::delete_site_icon('logo'); else self::save_site_icon_upload('logo');
             set_flash('设置已保存');
             go(admin_url(['tab' => 'settings']));
         }
@@ -444,12 +447,57 @@ final class Admin
         q("UPDATE app_users SET avatar='' WHERE id=?", [$uid]);
     }
 
+    // 站点图标上传表单项（预览 + file 输入 + 恢复默认勾选）。
+    private static function site_icon_field_html(string $kind, string $label, string $help): string
+    {
+        $ext = site_icon_ext($kind);
+        if ($kind === 'favicon') {
+            $preview = '<img src="' . h($ext !== '' ? site_icon_url('favicon') : asset_url('app/assets/index.svg')) . '" alt="" style="width:34px;height:34px;border-radius:8px;border:1px solid var(--border)">';
+        } else {
+            $preview = $ext !== ''
+                ? '<img src="' . h(site_icon_url('logo')) . '" alt="" style="width:34px;height:34px;border-radius:8px;border:1px solid var(--border);object-fit:cover">'
+                : '<span style="color:var(--text-subtle);font-size:var(--font-size-sm)">默认（站名首字母方块）</span>';
+        }
+        return '<label class="grid">' . form_field_caption($label, $help) . '<div style="display:flex;align-items:center;gap:12px">' . $preview
+            . '<input type="file" name="' . h($kind) . '" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon,image/vnd.microsoft.icon"></div></label>'
+            . checkbox('恢复默认', 'remove_' . $kind, false, '勾选后移除自定义，保存生效');
+    }
+
+    // 校验并保存上传的站点图标：错误码 → 大小 → is_uploaded_file → getimagesize 白名单 → 固定命名落盘。
+    private static function save_site_icon_upload(string $kind): void
+    {
+        $f = $_FILES[$kind] ?? null;
+        if (!$f || (int)$f['error'] === UPLOAD_ERR_NO_FILE) return;
+        if ((int)$f['error'] !== UPLOAD_ERR_OK) err('图标上传失败');
+        if ((int)$f['size'] > 2 * 1024 * 1024) err('图标不能超过 2MB');
+        if (!is_uploaded_file((string)$f['tmp_name'])) err('非法的上传文件');
+        $info = @getimagesize((string)$f['tmp_name']);
+        $ext = $info === false ? false : array_search((string)$info['mime'], ['png' => 'image/png', 'jpg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'ico' => 'image/vnd.microsoft.icon'], true);
+        if ($ext === false) err('图标仅支持 PNG/JPG/GIF/WebP/ICO 格式');
+        if (!is_dir(site_icon_dir())) mkdir(site_icon_dir(), 0755, true);
+        self::delete_site_icon($kind);
+        if (!move_uploaded_file((string)$f['tmp_name'], site_icon_file($kind, (string)$ext))) err('图标保存失败，请检查目录写权限');
+        save_settings_values(['site_' . $kind => (string)$ext]);
+    }
+
+    // 删除站点图标文件并清空设置（未设置时静默跳过）。
+    private static function delete_site_icon(string $kind): void
+    {
+        $ext = (string)setting('site_' . $kind, '');
+        if ($ext === '') return;
+        if (site_icon_mime($ext) !== '') {
+            $file = site_icon_file($kind, $ext);
+            if (is_file($file)) unlink($file);
+        }
+        save_settings_values(['site_' . $kind => '']);
+    }
+
     // --- 站点设置 ---
     private static function settings_view(): string
     {
         // 「允许评论」是评论插件的配套项：插件未启用时该项无意义，不渲染。
         $comment_on = isset(plugins()['comment']);
-        $html = '<div class="card"><div class="card-title">站点设置</div><form method="post">' . form_token()
+        $html = '<div class="card"><div class="card-title">站点设置</div><form method="post" enctype="multipart/form-data">' . form_token()
             . '<input type="hidden" name="admin_action" value="save_settings">'
             . '<div class="form-grid-2">'
             . input('站点名称', 'site_name', setting('site_name', 'Mono'), 'text', true)
@@ -458,6 +506,8 @@ final class Admin
             . input('站点描述', 'site_description', setting('site_description'))
             . input('关键词', 'site_keywords', setting('site_keywords'), 'text', false, '用于 SEO，逗号分隔')
             . input('摘要长度', 'excerpt_length', setting('excerpt_length', '160'), 'number')
+            . self::site_icon_field_html('favicon', '站点图标（favicon）', '显示在浏览器标签页；支持 PNG/JPG/GIF/WebP/ICO，不超过 2MB')
+            . self::site_icon_field_html('logo', '站点 Logo', '显示在顶部导航品牌区；支持 PNG/JPG/GIF/WebP/ICO，不超过 2MB')
             . ($comment_on ? checkbox('允许评论', 'allow_comment', setting('allow_comment', '1') === '1', '全站总开关；单篇文章可在写文章页单独关闭') : '')
             . checkbox('启用伪静态', 'pretty_url', setting('pretty_url', '0') === '1', '需服务器配置 URL 重写')
             . '<button class="btn" type="submit">保存设置</button></form></div>';
