@@ -334,6 +334,29 @@
     });
   }
 
+  // 站内锚点点击平滑滚动：页面加载 / 302 跳转（如提交评论后回 #comment）的锚点定位保持瞬时到位，
+  // 只有用户点击「当前页锚点链接」才平滑滚动；尊重 prefers-reduced-motion。
+  function bindAnchorScroll() {
+    document.addEventListener('click', function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      var a = e.target.closest ? e.target.closest('a[href*="#"]') : null;
+      if (!a || !a.hash || a.hash === '#') return;
+      // 仅拦截「当前页」锚点；跨页链接交给浏览器正常导航。
+      if (a.pathname !== location.pathname || a.search !== location.search) return;
+      var id = a.hash.slice(1);
+      try { id = decodeURIComponent(id); } catch (_) { return; }
+      var target = document.getElementById(id);
+      if (!target) return;
+      e.preventDefault();
+      var behavior = 'smooth';
+      try {
+        if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) behavior = 'auto';
+      } catch (_) { /* 忽略 */ }
+      target.scrollIntoView({ behavior: behavior, block: 'start' });
+      if (history.pushState) history.pushState(null, '', a.hash);
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', function () {
     showFlash(window.__pageFlash);
     bindConfirm();
@@ -342,5 +365,6 @@
     bindMarkdownEditor();
     bindCatQuickAdd();
     bindUserMenu();
+    bindAnchorScroll();
   });
 }());

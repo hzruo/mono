@@ -5,7 +5,8 @@ if (!defined('APP_ROOT')) exit;
  * 评论插件（comment）。
  *
  * 「万物皆插件」：核心不含评论逻辑，评论能力完全由本插件通过 Hook 与路由提供。
- * - hook post.content_after：在文章正文后渲染评论列表与发表表单（详情页单次触发，一次查询，无 N+1）。
+ * - hook post.content_after：在文章正文后渲染评论列表与发表表单（详情页单次触发；平铺 1 次查询、楼中楼 2 次，无 N+1）。
+ * - 楼中楼模式（可选，nested）：回复以 parent_id 挂到顶层评论下两层展示；旧库在渲染 / 提交 / 后台入口自动补列。
  * - route comment_submit：POST 提交评论（require_post + CSRF，支持游客昵称/邮箱）。
  * - route comment_delete：管理员删除评论。
  * - admin_tabs comment：插件配置子页只放设置；后台「评论」标签（admin.tabs）为分页审核列表，二者共用同一回调。
@@ -19,6 +20,7 @@ function comment_config(): array
     return [
         'require_login' => (int)($raw['require_login'] ?? 0) === 1,
         'moderate' => (int)($raw['moderate'] ?? 0) === 1,   // 先审后显
+        'nested' => (int)($raw['nested'] ?? 0) === 1,       // 楼中楼（回复嵌套显示）
         'per_page' => min(100, max(5, (int)($raw['per_page'] ?? 50))),
     ];
 }
@@ -26,8 +28,20 @@ function comment_config(): array
 function comment_install(array $plugin): void
 {
     $t = app_db_types();
-    app_db_create_table('plugin_comment_comments', "id {$t['id']},post_id {$t['uint']} NOT NULL,author {$t['string']} NOT NULL,email {$t['string']},content {$t['text']} NOT NULL,status {$t['uint']} NOT NULL DEFAULT 1,created_at {$t['uint']} NOT NULL");
+    app_db_create_table('plugin_comment_comments', "id {$t['id']},post_id {$t['uint']} NOT NULL,parent_id {$t['uint']} NOT NULL DEFAULT 0,author {$t['string']} NOT NULL,email {$t['string']},content {$t['text']} NOT NULL,status {$t['uint']} NOT NULL DEFAULT 1,created_at {$t['uint']} NOT NULL");
     app_db_create_index('idx_comment_post', 'plugin_comment_comments (post_id,status,created_at)');
+    app_db_create_index('idx_comment_parent', 'plugin_comment_comments (parent_id,status)');
+}
+
+// 表结构懒升级（幂等）：1.6.0 起新增楼中楼的 parent_id 列。
+// 插件文件升级不会自动重跑 install，故在渲染 / 提交 / 后台入口调用一次补齐；setting 标记后后续请求零成本跳过。
+function comment_upgrade_schema(): void
+{
+    if (setting('plugin_comment_schema', '1') === '2') return;
+    $t = app_db_types();
+    app_db_ensure_columns('plugin_comment_comments', ['parent_id' => $t['uint'] . ' NOT NULL DEFAULT 0']);
+    app_db_create_index('idx_comment_parent', 'plugin_comment_comments (parent_id,status)');
+    save_settings_values(['plugin_comment_schema' => '2']);
 }
 
 function comment_uninstall(array $plugin, bool $keep_data = true): void
@@ -74,6 +88,21 @@ function comment_css(): string
 .comment-editor-box textarea{display:block;width:100%;min-height:90px;padding:10px 12px;border:0;border-radius:0 0 calc(var(--radius) - 5px) calc(var(--radius) - 5px);background:transparent;resize:vertical}
 .comment-editor-box textarea:focus{outline:none;border:0;box-shadow:none}
 .comment-pending{background:color-mix(in oklab,var(--warning) 12%,transparent);border:1px solid color-mix(in oklab,var(--warning) 32%,transparent);color:var(--warning);padding:8px 12px;border-radius:6px;font-size:var(--font-size-sm);margin-bottom:12px}
+/* 发表按钮与输入区之间留出间距，不再贴紧 */
+.comment-form>.btn{margin-top:14px}
+/* 楼中楼（可选模式）：线程容器 + 缩进的子回复列表；顶层楼层可锚点直达 */
+.comment-thread{border-bottom:1px solid var(--line-soft);padding:14px 0}
+.comment-thread>.comment-item{padding:0;border-bottom:0}
+.comment-thread>.comment-item[id]{scroll-margin-top:84px}
+.comment-children{margin:12px 0 2px 52px;padding-left:14px;border-left:2px solid var(--line-soft)}
+.comment-children .comment-item{padding:8px 0;border-bottom:0}
+.comment-children .comment-item+.comment-item{border-top:1px dashed var(--border)}
+.comment-children .comment-item img{width:30px;height:30px}
+/* 「正在回复 @xxx」提示条（楼中楼模式，可取消） */
+.comment-reply-hint{display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:var(--font-size-xs);color:var(--muted-foreground)}
+.comment-reply-hint b{color:var(--primary);font-weight:600}
+.comment-reply-cancel{border:0;background:transparent;padding:0 2px;font-size:var(--font-size-xs);color:var(--text-subtle);cursor:pointer;border-radius:4px}
+.comment-reply-cancel:hover{color:var(--primary);background:var(--accent)}
 CSS;
 }
 
@@ -98,6 +127,27 @@ function comment_tbtn(string $icon, string $label, string $attr = ''): string
         . comment_icon($icon) . '</button>';
 }
 
+// 渲染单条评论（顶层与楼中楼子回复共用）。$reply_id 为点击「回复」时的目标楼层（顶层楼 id）；
+// $anchor 为 true 时输出 id="comment-item-N" 供跳转锚点定位。
+function comment_item_html(array $c, int $post_id, int $reply_id, bool $nested, bool $anchor = false): string
+{
+    $author = (string)$c['author'];
+    $html = '<div class="comment-item"' . ($anchor ? ' id="comment-item-' . (int)$c['id'] . '"' : '') . ' data-comment-author="' . h($author) . '">'
+        . '<img class="avatar" src="' . h(avatar_url((string)($c['email'] ?? '') !== '' ? (string)$c['email'] : $author, 80)) . '" alt="">'
+        . '<div class="comment-body"><div class="comment-head">'
+        . '<span class="name">' . h($author) . '</span>'
+        . '<span class="time">' . h(human_time((int)$c['created_at'])) . '</span>';
+    if (is_admin()) {
+        // 楼中楼删除顶层时会连带其下回复，确认文案予以说明。
+        $confirm = $nested && (int)($c['parent_id'] ?? 0) === 0 ? '删除这条评论？其下的回复将一并删除。' : '删除这条评论？';
+        $html .= post_action_form(route_url('comment_delete', ['id' => (int)$c['id']]), '删除', ['post_id' => $post_id], 'btn sm danger', $confirm);
+    }
+    // 回复 @：任意访客/登录用户可点；楼中楼模式下 data-reply-id 指向所属楼层。
+    $html .= '<button type="button" class="comment-reply-btn" data-reply="' . h($author) . '" data-reply-id="' . $reply_id . '">回复</button>'
+        . '</div><div class="comment-text">' . comment_format((string)$c['content']) . '</div></div></div>';
+    return $html;
+}
+
 // 渲染某篇文章的评论区（列表 + 表单）。详情页只调用一次。
 function comment_render_section(string $value, array $ctx): string
 {
@@ -107,35 +157,48 @@ function comment_render_section(string $value, array $ctx): string
     // 文章级开关：写文章页可单篇关闭评论（迁移前的旧数据缺列时视为允许）。
     if ((int)($ctx['post']['allow_comment'] ?? 1) !== 1) return $value;
 
+    comment_upgrade_schema();   // 老库（<1.6.0）补 parent_id 列，幂等
     $cfg = comment_config();
     $size = max(1, (int)$cfg['per_page']);
     $total = (int)val('SELECT COUNT(*) FROM plugin_comment_comments WHERE post_id=? AND status=1', [$post_id]);
     $page = max(1, (int)($_GET['page'] ?? 1));
-    if ($total > 0) $page = min($page, (int)ceil($total / $size));
-    $comments = all('SELECT * FROM plugin_comment_comments WHERE post_id=? AND status=1 ORDER BY created_at ASC, id ASC LIMIT ' . $size . ' OFFSET ' . (($page - 1) * $size), [$post_id]);
+    $page_url = fn(int $p): string => route_url('post', ['id' => $post_id, 'page' => $p]) . '#comment';
 
     // section 带 id="comment"：提交/删除跳转与分页链接都锚定到这里。
     $html = '<section class="comment-section card" id="comment" data-plugin-id="comment">';
     $html .= '<div class="card-title">评论（' . $total . '）</div>';
     if ($total === 0) {
         $html .= '<div class="comment-empty">还没有评论，来抢沙发吧。</div>';
-    } else {
-        foreach ($comments as $c) {
-            $author = (string)$c['author'];
-            $html .= '<div class="comment-item" data-comment-author="' . h($author) . '">'
-                . '<img class="avatar" src="' . h(avatar_url((string)($c['email'] ?? '') !== '' ? (string)$c['email'] : $author, 80)) . '" alt="">'
-                . '<div class="comment-body"><div class="comment-head">'
-                . '<span class="name">' . h($author) . '</span>'
-                . '<span class="time">' . h(human_time((int)$c['created_at'])) . '</span>';
-            if (is_admin()) {
-                $html .= post_action_form(route_url('comment_delete', ['id' => (int)$c['id']]), '删除', ['post_id' => $post_id], 'btn sm danger', '删除这条评论？');
+    } elseif ($cfg['nested']) {
+        // 楼中楼：只对顶层评论分页，子回复随所属楼层一并取出（回复与父楼不会被分页拆散）。
+        $roots_total = (int)val('SELECT COUNT(*) FROM plugin_comment_comments WHERE post_id=? AND status=1 AND parent_id=0', [$post_id]);
+        $page = $roots_total > 0 ? min($page, (int)ceil($roots_total / $size)) : 1;
+        $roots = all('SELECT * FROM plugin_comment_comments WHERE post_id=? AND status=1 AND parent_id=0 ORDER BY created_at ASC, id ASC LIMIT ' . $size . ' OFFSET ' . (($page - 1) * $size), [$post_id]);
+        // 子回复一次批查后按父楼层归组（id 均来自数据库，直接拼接安全）。
+        $children = [];
+        if ($roots) {
+            $ids = implode(',', array_map(static fn(array $r): int => (int)$r['id'], $roots));
+            foreach (all('SELECT * FROM plugin_comment_comments WHERE status=1 AND parent_id IN (' . $ids . ') ORDER BY created_at ASC, id ASC') as $c) {
+                $children[(int)$c['parent_id']][] = $c;
             }
-            // 回复 @：任意访客/登录用户可点，将「@昵称 」插入到评论框并聚焦。
-            $html .= '<button type="button" class="comment-reply-btn" data-reply="' . h($author) . '">回复</button>'
-                . '</div><div class="comment-text">' . comment_format((string)$c['content']) . '</div></div></div>';
         }
-        // 分页：条数取插件设置（per_page），页码链接锚定评论区。
-        $html .= paginate($total, $page, $size, fn(int $p): string => route_url('post', ['id' => $post_id, 'page' => $p]) . '#comment');
+        foreach ($roots as $c) {
+            $cid = (int)$c['id'];
+            $html .= '<div class="comment-thread">' . comment_item_html($c, $post_id, $cid, true, true);
+            if (!empty($children[$cid])) {
+                $html .= '<div class="comment-children">';
+                foreach ($children[$cid] as $cc) $html .= comment_item_html($cc, $post_id, $cid, true);
+                $html .= '</div>';
+            }
+            $html .= '</div>';
+        }
+        if ($roots_total > 0) $html .= paginate($roots_total, $page, $size, $page_url);
+    } else {
+        // 平铺：全部评论逐条列出（原行为）。
+        $page = min($page, (int)ceil($total / $size));
+        $comments = all('SELECT * FROM plugin_comment_comments WHERE post_id=? AND status=1 ORDER BY created_at ASC, id ASC LIMIT ' . $size . ' OFFSET ' . (($page - 1) * $size), [$post_id]);
+        foreach ($comments as $c) $html .= comment_item_html($c, $post_id, (int)$c['id'], false);
+        $html .= paginate($total, $page, $size, $page_url);
     }
 
     // 发表表单。
@@ -144,11 +207,13 @@ function comment_render_section(string $value, array $ctx): string
         $html .= '<div class="comment-pending">请<a href="' . h(route_url('login')) . '">登录</a>后发表评论。</div>';
     } else {
         $html .= '<form class="comment-form" method="post" action="' . h(route_url('comment_submit')) . '" style="margin-top:16px">' . form_token()
-            . '<input type="hidden" name="post_id" value="' . $post_id . '">';
+            . '<input type="hidden" name="post_id" value="' . $post_id . '">'
+            . ($cfg['nested'] ? '<input type="hidden" name="parent_id" value="0">' : '');
         if (!$me) {
             $html .= '<div class="form-grid-2">' . input('昵称', 'author', '', 'text', true) . input('邮箱', 'email', '', 'email', false, '你的邮箱不会公开') . '</div>';
         }
         $html .= '<div class="comment-editor">' . form_field_caption('评论内容', '')
+            . ($cfg['nested'] ? '<div class="comment-reply-hint" hidden>正在回复 <b class="comment-reply-hint-name"></b><button type="button" class="comment-reply-cancel" data-reply-cancel>取消</button></div>' : '')
             . '<div class="comment-editor-box">'
             . '<div class="comment-toolbar">'
             . '<button type="button" class="comment-tbtn comment-emoji-btn" title="表情" aria-label="表情" aria-haspopup="true" aria-expanded="false">' . comment_icon('smile') . '</button>'
@@ -304,8 +369,21 @@ function comment_js(): string
     });
   }
   // 回复 @：全局委派，点击评论条目的「回复」按钮 → 将「@昵称 」追加到评论框末尾并聚焦。
+  // 楼中楼模式下同时把回复目标写入表单（子回复按钮的 data-reply-id 指向所属楼层），并显示可取消的提示条。
   function bindReplyButtons() {
     document.addEventListener('click', function (e) {
+      // 取消回复：恢复为顶层评论。
+      var cancel = e.target.closest ? e.target.closest('[data-reply-cancel]') : null;
+      if (cancel) {
+        var cform = cancel.closest('form');
+        if (cform) {
+          var chid = cform.querySelector('input[name="parent_id"]');
+          if (chid) chid.value = '0';
+          var chint = cform.querySelector('.comment-reply-hint');
+          if (chint) chint.hidden = true;
+        }
+        return;
+      }
       var btn = e.target.closest ? e.target.closest('.comment-reply-btn') : null;
       if (!btn) return;
       var section = btn.closest('.comment-section');
@@ -314,6 +392,19 @@ function comment_js(): string
       if (!ta) return;
       var name = btn.getAttribute('data-reply') || '';
       if (!name) return;
+      // 楼中楼模式（表单含 parent_id 隐藏域）：记录回复目标并显示提示条。
+      var form = ta.closest('form');
+      var pid = btn.getAttribute('data-reply-id') || '';
+      if (form && pid) {
+        var hidden = form.querySelector('input[name="parent_id"]');
+        if (hidden) {
+          hidden.value = pid;
+          var hint = form.querySelector('.comment-reply-hint');
+          var hintName = form.querySelector('.comment-reply-hint-name');
+          if (hint) hint.hidden = false;
+          if (hintName) hintName.textContent = '@' + name;
+        }
+      }
       var mention = '@' + name + ' ';
       var v = ta.value;
       // 避免重复插入同一 mention（若已在末尾则仅聚焦）。
@@ -342,6 +433,7 @@ JS;
 function comment_submit(array $plugin): void
 {
     require_post();
+    comment_upgrade_schema();   // 老库（<1.6.0）补 parent_id 列，幂等
     $post_id = (int)($_POST['post_id'] ?? 0);
     $post = row('app_posts', 'id', $post_id);
     if (!$post || (int)$post['status'] !== 1) err('文章不存在');
@@ -367,34 +459,53 @@ function comment_submit(array $plugin): void
         if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) { set_flash('邮箱格式不正确', 'error'); go($back); }
     }
 
+    // 楼中楼：解析回复目标——必须是本文的顶层评论；目标是子回复时归位到所属楼层；非法则视为顶层评论。
+    $parent_id = (int)($_POST['parent_id'] ?? 0);
+    if ($parent_id > 0) {
+        $parent = row('plugin_comment_comments', 'id', $parent_id);
+        if (!$parent || (int)$parent['post_id'] !== $post_id) {
+            $parent_id = 0;
+        } elseif ((int)$parent['parent_id'] > 0) {
+            $parent_id = (int)$parent['parent_id'];
+        }
+    }
+
     // 简单防刷：同 IP 60 秒内只能发一条。
     $ip = (string)($_SERVER['REMOTE_ADDR'] ?? '');
     $recent = one('SELECT id FROM plugin_comment_comments WHERE created_at>? ORDER BY id DESC LIMIT 1', [now() - 60]);
-    $status = $cfg['moderate'] ? 0 : 1;
+    // 先审后显开启时游客评论进入待审；管理员（博主）的评论与回复视为已审，直接显示。
+    $status = $cfg['moderate'] && !is_admin() ? 0 : 1;
 
-    q('INSERT INTO plugin_comment_comments(post_id,author,email,content,status,created_at) VALUES(?,?,?,?,?,?)',
-        [$post_id, $author, $email, $content, $status, now()]);
+    q('INSERT INTO plugin_comment_comments(post_id,parent_id,author,email,content,status,created_at) VALUES(?,?,?,?,?,?,?)',
+        [$post_id, $parent_id, $author, $email, $content, $status, now()]);
 
     set_flash($status === 1 ? '评论发表成功' : '评论已提交，等待审核');
-    // 新评论按时间排在最后一页：公开的评论直接跳到对应页码，作者能立即看到自己。
+    // 新内容直接跳到能看到自己的位置：楼中楼的回复定位到所属楼层页（锚点直达楼层），其余跳到最后一页。
     $back = route_url('post', ['id' => $post_id]) . '#comment';
     if ($status === 1) {
-        $size = max(1, $cfg['per_page']);
-        $count = (int)val('SELECT COUNT(*) FROM plugin_comment_comments WHERE post_id=? AND status=1', [$post_id]);
-        $last = max(1, (int)ceil($count / $size));
-        if ($last > 1) $back = route_url('post', ['id' => $post_id, 'page' => $last]) . '#comment';
+        $size = max(1, (int)$cfg['per_page']);
+        if ($cfg['nested'] && $parent_id > 0) {
+            $pos = (int)val('SELECT COUNT(*) FROM plugin_comment_comments WHERE post_id=? AND status=1 AND parent_id=0 AND id<=?', [$post_id, $parent_id]);
+            $last = max(1, (int)ceil($pos / $size));
+            $back = route_url('post', ['id' => $post_id] + ($last > 1 ? ['page' => $last] : [])) . '#comment-item-' . $parent_id;
+        } else {
+            $count = (int)val('SELECT COUNT(*) FROM plugin_comment_comments WHERE post_id=? AND status=1' . ($cfg['nested'] ? ' AND parent_id=0' : ''), [$post_id]);
+            $last = max(1, (int)ceil($count / $size));
+            if ($last > 1) $back = route_url('post', ['id' => $post_id, 'page' => $last]) . '#comment';
+        }
     }
     go($back);
 }
 
-// 删除评论（管理员）。
+// 删除评论（管理员）。楼中楼模式下删除顶层楼层时，其下的回复一并删除，避免留下孤儿。
 function comment_delete(array $plugin): void
 {
     need_admin();
     require_post();
     $id = (int)($_GET['id'] ?? 0);
     $post_id = (int)($_POST['post_id'] ?? 0);
-    q('DELETE FROM plugin_comment_comments WHERE id=?', [$id]);
+    if (comment_config()['nested']) q('DELETE FROM plugin_comment_comments WHERE id=? OR parent_id=?', [$id, $id]);
+    else q('DELETE FROM plugin_comment_comments WHERE id=?', [$id]);
     set_flash('评论已删除');
     go($post_id > 0 ? route_url('post', ['id' => $post_id]) : admin_url(['tab' => 'plugins', 'view' => 'comment']));
 }
@@ -411,17 +522,24 @@ function comment_admin_tabs(array $tabs, array $ctx): array
 // - 「插件 → 评论 → 配置」（?a=admin&tab=plugins&view=comment）：只显示插件设置，不再重复显示列表。
 function comment_admin(array $plugin): string
 {
+    comment_upgrade_schema();   // 老库（<1.6.0）补 parent_id 列，幂等
     $from_tab = (string)($_GET['tab'] ?? '') === 'comment';
     $back = $from_tab ? admin_url(['tab' => 'comment']) : admin_url(['tab' => 'plugins', 'view' => 'comment']);
     if (is_post_request()) {
         $action = (string)($_POST['comment_admin_action'] ?? '');
         $id = (int)($_POST['id'] ?? 0);
         if ($action === 'approve') { q('UPDATE plugin_comment_comments SET status=1 WHERE id=?', [$id]); set_flash('评论已通过'); }
-        elseif ($action === 'delete') { q('DELETE FROM plugin_comment_comments WHERE id=?', [$id]); set_flash('评论已删除'); }
+        elseif ($action === 'delete') {
+            // 楼中楼模式下删除顶层楼层时，其下的回复一并删除。
+            if (comment_config()['nested']) q('DELETE FROM plugin_comment_comments WHERE id=? OR parent_id=?', [$id, $id]);
+            else q('DELETE FROM plugin_comment_comments WHERE id=?', [$id]);
+            set_flash('评论已删除');
+        }
         elseif ($action === 'save') {
             plugin_save_config('comment', [
                 'require_login' => (int)($_POST['require_login'] ?? 0) === 1 ? 1 : 0,
                 'moderate' => (int)($_POST['moderate'] ?? 0) === 1 ? 1 : 0,
+                'nested' => (int)($_POST['nested'] ?? 0) === 1 ? 1 : 0,
                 'per_page' => (string)min(100, max(5, (int)($_POST['per_page'] ?? 50))),
             ]);
             set_flash('评论设置已保存');
@@ -442,7 +560,7 @@ function comment_admin(array $plugin): string
         $html .= '<table class="list"><thead><tr><th>作者</th><th>内容</th><th>文章</th><th>状态</th><th>时间</th><th class="actions">操作</th></tr></thead><tbody>';
         foreach ($comments as $c) {
             $html .= '<tr><td>' . h((string)$c['author']) . '</td>'
-                . '<td style="max-width:280px">' . h(cut((string)$c['content'], 40)) . '</td>'
+                . '<td style="max-width:280px">' . ((int)($c['parent_id'] ?? 0) > 0 ? '<span class="badge">回复</span> ' : '') . h(cut((string)$c['content'], 40)) . '</td>'
                 . '<td><a href="' . h(route_url('post', ['id' => (int)$c['post_id']])) . '">' . h(cut((string)($c['title'] ?? '—'), 16)) . '</a></td>'
                 . '<td>' . ((int)$c['status'] === 1 ? '<span class="badge">已显示</span>' : '<span class="badge draft">待审</span>') . '</td>'
                 . '<td style="color:var(--text-subtle)">' . h(date('Y-m-d H:i', (int)$c['created_at'])) . '</td>'
@@ -463,6 +581,7 @@ function comment_admin(array $plugin): string
         . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="comment_admin_action" value="save">'
         . checkbox('登录后才能评论', 'require_login', $cfg['require_login'])
         . checkbox('评论先审后显', 'moderate', $cfg['moderate'])
+        . checkbox('楼中楼模式', 'nested', $cfg['nested'], '回复嵌套显示在对应评论下方；关闭则为平铺列表（@回复）')
         . input('评论区每页条数', 'per_page', (string)$cfg['per_page'], 'number', false, '5-100，评论区分页的每页条数')
         . '<div class="btn-row"><button class="btn" type="submit">保存设置</button></div></form>'
         . '<div class="note" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">'
@@ -474,8 +593,8 @@ function comment_admin(array $plugin): string
 return [
     'id' => 'comment',
     'name' => '评论',
-    'version' => '1.4.0',
-    'description' => '为文章开启评论功能，支持游客或登录后发表、先审后显与后台分页审核（后台导航「评论」标签直达列表，插件配置页只保留设置）；可在写文章页按文章单独关闭评论；评论框带图标工具栏（表情/加粗/斜体/代码/链接）与 @回复，内容支持轻量行内格式。',
+    'version' => '1.6.0',
+    'description' => '为文章开启评论功能，支持游客或登录后发表、先审后显（管理员评论与回复免审）与后台分页审核（后台导航「评论」标签直达列表，插件配置页只保留设置），可选楼中楼模式（回复嵌套在对应评论下方）；可在写文章页按文章单独关闭评论；评论框带图标工具栏（表情/加粗/斜体/代码/链接）与 @回复，内容支持轻量行内格式。',
     'author' => 'Mono',
     'assets' => ['css' => 'comment_css', 'js' => 'comment_js'],
     'hooks' => ['post.content_after' => 'comment_render_section', 'admin.tabs' => 'comment_admin_tabs'],

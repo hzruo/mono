@@ -7,7 +7,7 @@ if (!defined('APP_ROOT')) exit;
  * 参考编辑风博客（暖纸底色 + 陶土橙强调 + 衬线标题 + 单栏居中阅读）重做全站观感，零核心改动：
  * - hook page.head：注入完整语义令牌（:root 亮色 / .dark 暗色）与显示字体变量，覆盖核心 zinc 中性配色。
  * - hook page.template：可选为 <html> 追加 .dark 类（站点默认暗色；访客仍可用导航栏按钮切换）。
- * - hook page.before_render：首页顶部注入一行站点描述作引言（未设置描述时展示站点名称），不新增内容。
+ * - hook page.before_render：首页顶部注入一行站点描述作引言（描述留空时不展示），不新增内容。
  * - assets css：单栏居中、侧栏下移、衬线标题、磨砂顶栏、纸面卡片等结构性增强（合并进 plugins.css）。
  * - admin_tabs paper：后台调强调色预设 / 自定义色、衬线标题、首页引言与默认暗色。
  *
@@ -132,18 +132,17 @@ function paper_template(string $value, array $ctx): string
     return preg_replace('/<html(\s[^>]*)?>/i', '<html$1 class="dark">', $value, 1) ?? $value;
 }
 
-// 首页引言：仅在首页第 1 页注入站点描述作标题（未设置描述时展示站点名称；不与顶栏品牌重复）。
+// 首页引言：仅在首页第 1 页注入站点描述作标题（描述留空则不展示，不回退站点名称以免与顶栏品牌重复）。
 function paper_hero(string $value, array $ctx): string
 {
     if (!paper_config()['hero']) return $value;
     if (($_GET['a'] ?? 'home') !== 'home' || current_page() > 1) return $value;
+    $desc = trim(setting('site_description', ''));
+    if ($desc === '') return $value;   // 不想写副标题（描述留空）→ 不注入引言
     $marker = '<div class="main" data-slot="page.before_render">';
     if (!str_contains($value, $marker)) return $value;
-    $name = trim(setting('site_name', 'Mono'));
-    $desc = trim(setting('site_description', ''));
-    if ($name === '' && $desc === '') return $value;
     $hero = '<header class="paper-hero">'
-        . '<h1 class="paper-hero-title">' . h($desc !== '' ? $desc : $name) . '</h1>'
+        . '<h1 class="paper-hero-title">' . h($desc) . '</h1>'
         . '<span class="paper-hero-rule"></span></header>';
     return str_replace($marker, $marker . $hero, $value);
 }
@@ -250,7 +249,7 @@ function paper_admin(array $plugin): string
         . select_input('强调色预设', 'preset', $cfg['preset'], $options, '用于链接、按钮、标签与选中态')
         . input('自定义强调色', 'accent', $cfg['accent'], 'text', false, '留空则用预设色，格式 #RRGGBB；填了则覆盖预设')
         . checkbox('衬线标题', 'serif', $cfg['serif'], '文章标题与正文小标题使用衬线字体（Georgia / 宋体栈），关闭则全部用无衬线')
-        . checkbox('首页引言', 'hero', $cfg['hero'], '首页顶部展示一行站点描述（取自「设置 → 站点描述」），留空则展示站点名称')
+        . checkbox('首页引言', 'hero', $cfg['hero'], '首页顶部展示一行站点描述（取自「设置 → 站点描述」），描述留空时不展示')
         . checkbox('默认暗色', 'dark', $cfg['dark'], '站点默认进入暗色；访客仍可通过导航栏按钮自行切换深浅色')
         . '<button class="btn" type="submit">保存主题</button></form>';
 }
@@ -258,7 +257,7 @@ function paper_admin(array $plugin): string
 return [
     'id' => 'paper',
     'name' => '暖纸主题',
-    'version' => '1.0.3',
+    'version' => '1.0.4',
     'description' => '编辑风整站主题：暖纸底色 + 陶土橙强调 + 衬线标题 + 单栏居中阅读，含磨砂顶栏、纸面卡片与亮暗双色，可自定义强调色。',
     'author' => 'Mono',
     'assets' => ['css' => 'paper_css'],

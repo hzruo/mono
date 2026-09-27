@@ -1082,9 +1082,10 @@ function page_footer_html(array $flash): string
 {
     $footer = (string)hook('page.footer', '', []);
     $year = date('Y');
-    // 页脚署名固定为程序名 Mono，链接开源仓库（预留地址）。
+    // 页脚署名固定为程序名 Mono，链接开源仓库（预留地址）；末尾附 RSS 订阅入口。
     $base = '<div class="footer" data-slot="page.footer">' . $footer
-        . '<div>Powered by <a href="https://github.com/hzruo/mono" target="_blank" rel="noopener">Mono</a> · ' . $year . '</div></div>';
+        . '<div>Powered by <a href="https://github.com/hzruo/mono" target="_blank" rel="noopener">Mono</a> · ' . $year
+        . ' · <a href="' . h(route_url('rss')) . '" title="RSS 订阅">RSS</a></div></div>';
     $js = '<script>window.__pageFlash=' . json_encode($flash, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ';</script>'
         . '<script src="' . h(asset_url('app/assets/index.js')) . '?v=' . h(APP_VERSION) . '" defer></script>' . plugin_asset_tag('js');
     return $base . $js . '</body></html>';

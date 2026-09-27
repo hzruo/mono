@@ -99,7 +99,9 @@
  * 导致 hidden 属性失效（元素常显）。用 !important 保证「hidden = 不渲染」的语义对核心组件与全部插件稳定成立。 */
 [hidden] { display: none !important; }
 
-html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+/* 不设 scroll-behavior: smooth——否则页面加载/跳转（如提交评论后跳 #comment）的锚点定位也会整页滑动；
+   点击锚点链接的平滑滚动由 index.js 的锚点增强提供。 */
+html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
