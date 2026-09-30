@@ -657,34 +657,26 @@ function imgbed_worker_dialog(array $cfg): string
 // WebDAV 反代（Cloudflare Worker）：图片请求透传转发；访问根路径显示自检页。
 const TARGET = '__TARGET__';   // ← 你的 WebDAV 目录地址（本代码已按后台「地址」自动填入）
 
-const IT_WORKS = (env, state) => `<!doctype html>
+const IT_WORKS = (state) => `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebDAV 反代自检 · It works!</title>
+<title>It works!</title>
 <style>
 body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f9;color:#24292f;margin:0;padding:40px 16px}
-main{max-width:600px;margin:0 auto;background:#fff;border:1px solid #e4e6ea;border-radius:12px;padding:24px 28px}
-h1{font-size:19px;margin:0 0 6px}
-.sub{color:#8a919b;font-size:13px;margin:0 0 18px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-td{padding:9px 0;border-top:1px solid #eef0f3;vertical-align:top;line-height:1.6}
-td:first-child{color:#8a919b;width:88px;white-space:nowrap}
-code{background:#f1f3f6;border-radius:4px;padding:1px 6px;font-size:12.5px;word-break:break-all}
+main{max-width:420px;margin:0 auto;background:#fff;border:1px solid #e4e6ea;border-radius:12px;padding:24px 28px;text-align:center}
+h1{font-size:18px;margin:0 0 8px}
+.sub{color:#8a919b;font-size:13px;margin:0 0 16px;line-height:1.7}
 .ok{color:#1a7f37}.bad{color:#cf222e}
 .tip{margin:16px 0 0;padding-top:14px;border-top:1px solid #eef0f3;font-size:13px;color:#57606a;line-height:1.8}
 </style>
 </head>
 <body><main>
-<h1>✅ WebDAV 反代 · It works!</h1>
-<p class="sub">Worker 部署成功，正在运行。本提示页只出现在根路径，图片请求会原样转发。</p>
-<table>
-<tr><td>转发目标</td><td><code>${TARGET}</code></td></tr>
-<tr><td>环境变量</td><td>${env.U && env.P ? '<span class="ok">U / P 已配置</span>' : '<span class="bad">未配置 U / P</span>（Settings → Variables and Secrets 中添加）'}</td></tr>
-<tr><td>上游自检</td><td>${state}</td></tr>
-</table>
-<p class="tip">自检通过后，把本 Worker 域名填到博客后台「图床 → 访问域名」并保存。<br>若自检失败：先核对「转发目标」与后台「地址」是否完全一致，再检查 U / P 与 WebDAV 账号是否一致。</p>
+<h1>✅ It works!</h1>
+<p class="sub">Worker 已就绪，图片请求会正常转发。</p>
+<p class="sub">上游状态：${state}</p>
+<p class="tip">把本 Worker 域名填到博客后台「图床 → 访问域名」并保存即可。</p>
 </main></body>
 </html>`;
 
@@ -694,18 +686,17 @@ export default {
     const headers = env.U && env.P ? { Authorization: 'Basic ' + btoa(env.U + ':' + env.P) } : {};
     // 根路径：返回自检提示页（不转发）。
     if (u.pathname === '/') {
-      let state = '<span class="bad">未配置 U / P，无法探测上游</span>';
+      let state = '<span class="bad">未就绪</span>';
       if (env.U && env.P) {
         try {
           const pr = await fetch(TARGET + '/', { headers });
-          if (pr.ok) state = '<span class="ok">✅ 上传目录可访问（上游 HTTP ' + pr.status + '）</span>';
-          else if (pr.status === 401) state = '<span class="bad">❌ 认证失败（HTTP 401）：U / P 与 WebDAV 账号不一致</span>';
-          else state = '<span class="bad">❌ 转发目标不可用（上游 HTTP ' + pr.status + '）：请核对「转发目标」与后台「地址」是否完全一致</span>';
+          if (pr.ok) state = '<span class="ok">✅ 正常</span>';
+          else state = '<span class="bad">❌ 异常</span>';
         } catch (e) {
-          state = '<span class="bad">❌ 无法连接转发目标：' + e + '</span>';
+          state = '<span class="bad">❌ 异常</span>';
         }
       }
-      return new Response(IT_WORKS(env, state), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+      return new Response(IT_WORKS(state), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
     }
     // 其余路径：转发到 WebDAV（图片读取 / 上传）。
     const r = await fetch(TARGET + u.pathname, { headers });
@@ -729,12 +720,12 @@ JS;
         . '<li>登录 Cloudflare 控制台 → <b>Workers &amp; Pages</b> → 创建 Worker（免费计划即可）。</li>'
         . '<li>进入 Worker 的 <b>Edit Code</b>，把下方代码整段粘贴覆盖后 <b>Deploy</b>。</li>'
         . '<li>在 Worker 的 <b>Settings → Variables and Secrets</b> 添加两个变量：<code>U</code> = WebDAV 用户名、<code>P</code> = WebDAV 密码（类型建议选 Secret）。</li>'
-        . '<li>打开 Worker 域名根路径（如 <code>https://img-xxx.workers.dev/</code>），看到「✅ It works!」自检页且各项通过，说明反代可用。</li>'
+        . '<li>打开 Worker 域名根路径（如 <code>https://img-xxx.workers.dev/</code>），看到「✅ It works!」自检页且「上游状态」为正常，说明反代可用。</li>'
         . '<li>复制 Worker 域名填入本页「访问域名」并保存；再用无痕窗口打开测试连接给出的图片链接复核。</li>'
         . '</ol>'
         . '<div class="imgbed-code"><pre data-imgbed-code>' . h($code) . '</pre>'
         . '<button type="button" class="btn sm ghost" data-imgbed-copy-code>复制代码</button></div>'
-        . '<p class="imgbed-dialog-note">转发地址已按你填写的「地址」自动生成；以后更换 WebDAV 地址需同步修改 Worker 代码。部署完成后打开 Worker 域名根路径，可看到「✅ It works!」自检页（转发目标 / 环境变量 / 上游探测结果）。访客经由 Worker 域名读取图片，凭据仅存于 Worker 环境变量。</p>'
+        . '<p class="imgbed-dialog-note">转发地址已按你填写的「地址」自动生成；以后更换 WebDAV 地址需同步修改 Worker 代码。部署完成后打开 Worker 域名根路径，可看到「✅ It works!」自检页（仅显示上游状态，不暴露转发目标等细节）；若显示「异常」，先核对 Worker 代码里的转发地址与后台「地址」是否一致，再检查 U / P 与 WebDAV 账号是否一致。访客经由 Worker 域名读取图片，凭据仅存于 Worker 环境变量。</p>'
         . '</div></dialog>';
 }
 
