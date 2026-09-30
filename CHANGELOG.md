@@ -12,6 +12,30 @@
 
 ---
 
+## [1.17.0] - 2026-09-30
+
+### 新增
+
+- **站内提示弹窗**：核心新增 `window.MonoAlert(文案)` 编程式提示弹窗——与二次确认弹窗同款视觉，单按钮「知道了」，Enter / Esc / 点遮罩均可关闭，支持多行文案（长链接自动断行）；插件与页面脚本的提示 / 报错不再使用浏览器原生 alert（[app/assets/index.js](app/assets/index.js)、[app/assets/index.css](app/assets/index.css)）。
+- **备份文件 gzip 压缩**：备份插件新增「压缩备份文件（.gz）」开关（默认开）——开启后本地留存、邮件附件与 WebDAV 上传均为 `.gz` 压缩文件，体积显著减小；文件列表 / 下载 / 删除照常，本地还原与上传还原自动识别解压（[app/plugins/backup](app/plugins/backup)）。
+- **WebDAV 远端保留份数清理**：WebDAV 渠道上传成功后，自动列出远端目录并按「保留份数」删除多余的旧备份——仅删除本插件生成的 `backup-` 文件，其它文件不受影响；网盘不支持列目录（PROPFIND）时自动跳过，不影响备份与上传（[app/plugins/backup](app/plugins/backup)）。
+
+### 变更
+
+- **imgbed 交互提示站内化**：写文章页图床提示（未配置引导、上传失败汇总、拖拽非图片）与后台复制反馈全部改用站内弹窗；「复制链接 / 复制反代代码」的失败兜底由浏览器 prompt 改为隐藏文本框复制，仍失败时弹站内提示展示全文（[app/plugins/imgbed/plugin.php](app/plugins/imgbed/plugin.php)）。
+- **moments 交互提示站内化**：发布框选图校验（张数 / 大小）、上传与点赞失败、媒体按钮未就绪等提示全部改用站内弹窗（[app/plugins/moments/plugin.php](app/plugins/moments/plugin.php)）。
+- **备份插件配置项按渠道展开**：定时备份 / 邮箱 / WebDAV 三组配置改为「勾选启用后展开」，未启用时收起；折叠的字段仍随表单提交，来回切换不丢已填数据（[app/plugins/backup/plugin.php](app/plugins/backup/plugin.php)）。
+
+### 修复
+
+- **安装界面数据库字段容忍首尾空白**：数据库名 / 地址 / 端口 / 用户名 / 密码等连接字段统一清除输入的首尾空白（含 SQLite 文件名）——此前粘贴带入的空格会原样写入配置，导致 MySQL / PostgreSQL 报「Unknown database ' xxx '」这类难以定位的安装失败；数据库名去空格后为空时给出明确提示，不再写入半成品配置（[app/optional/Setup.php](app/optional/Setup.php)）。
+
+### 插件
+
+- imgbed：`1.0.0 → 1.1.0`（写文章页「图片」按钮与核心工具栏合并：配置完成后点击直接选图（可多选）上传并插入正文；支持粘贴截图 / 拖拽图片直传，先占位后回填）；`1.1.0 → 1.1.1`（提示弹窗与复制兜底改用站内 UI）；`1.1.1 → 1.1.2`（上传超限明确提示：错误码 1 直接给出 PHP upload_max_filesize 说明与调整方法；选图 / 粘贴 / 拖拽按「插件上限与 PHP 限制的最小值」预检跳过超限图片，避免无效上传）；`1.1.2 → 1.1.3`（WebDAV 兼容 Koofr：PUT 遇非标 404 同样自动补建目录链后重试）。
+- moments：`1.4.0 → 1.4.1`（提示弹窗改用站内 UI）；`1.4.1 → 1.4.2`（上传超限提示同步明确化：错误码 1 给出 PHP upload_max_filesize 说明与调整方法）。
+- backup：`1.0.2 → 1.0.3`（WebDAV 推送修复：认证改为随请求预先发送，消除「账号密码正确也报认证失败（HTTP 401）」的误报；目录不存在时兼容 TeraCloud / InfiniCLOUD 非标 403 自动逐级创建后重试；错误文案区分「认证失败」与「无写入权限 / 目录无法创建」）；`1.0.3 → 1.0.4`（新增 gzip 压缩开关（默认开），本地留存 / 邮件附件 / WebDAV 均推送 .gz，还原自动解压；配置项按启用勾选展开收起；WebDAV 兼容 Koofr 非标 404 补建目录链；上传成功后 PROPFIND 列目录并按保留份数同步清理远端旧备份）。
+
 ## [1.16.0] - 2026-09-27
 
 ### 新增

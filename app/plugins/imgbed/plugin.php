@@ -6,7 +6,8 @@ if (!defined('APP_ROOT')) exit;
  *
  * 把写作图片上传到外部对象存储（零第三方依赖，curl / stream 双通道）：
  * - 四种存储源单选：阿里云 OSS / 腾讯云 COS / Cloudflare R2 / WebDAV。
- * - 写文章页工具栏注入「上传图片」按钮：选图 → AJAX 上传 → 以 Markdown 自动插入光标处。
+ * - 写文章页图片入口：图床配置完成后与核心工具栏「图片」按钮合并（选图 / 多选 → AJAX 上传 →
+ *   以 Markdown 自动插入光标处）；支持直接粘贴截图或拖拽图片文件到编辑区自动上传（「上传中」占位回填）。
  * - 上传记录存 plugin_imgbed_files；后台「图床」标签分页浏览（复制链接 / 删除，
  *   删除时尽力同步删除远端对象）；「插件 → 图床」配置页管理凭据与图片处理开关。
  * - 跨插件复用：imgbed_handle_upload / imgbed_delete_file 供其它插件直接调用
@@ -235,8 +236,8 @@ function imgbed_store(array $cfg, string $method, string $key, string $mime, ?st
     [$url, $headers, $error] = imgbed_signed_request($cfg, $method, $key, $mime, $bytes);
     if ($error !== '') return [false, $error];
     [$ok, $status, $body] = imgbed_http($method, $url, $headers, $bytes, $method === 'PUT' ? 120 : 30);
-    // WebDAV 父目录不存在：标准返回 409 Conflict，部分服务器（如 TeraCloud）返回 403；两种情况均逐级 MKCOL 后重试一次。
-    if ($method === 'PUT' && $ok && in_array($status, [403, 409], true) && $cfg['source'] === 'webdav') {
+    // WebDAV 父目录不存在：标准返回 409 Conflict，部分服务器返回非标状态码（TeraCloud / InfiniCLOUD 403，Koofr 404）；均逐级 MKCOL 后重试一次。
+    if ($method === 'PUT' && $ok && in_array($status, [403, 404, 409], true) && $cfg['source'] === 'webdav') {
         imgbed_webdav_mkdir($cfg, $key);
         [$ok, $status, $body] = imgbed_http($method, $url, $headers, $bytes, 120);
     }
@@ -250,19 +251,23 @@ function imgbed_store(array $cfg, string $method, string $key, string $mime, ?st
     return [false, 'HTTP ' . $status . $hint . imgbed_err_snip($body)];
 }
 
-// WebDAV：逐级创建对象键中的目录（已存在返回 405，一并忽略）。
+// WebDAV：从根逐级创建「地址自身层级 + 对象键中的目录」（已存在返回 405 / 301 / 302 等，一律忽略响应）。
+// 从根建而非从「地址」之下建：Koofr 等实现 PUT 缺父目录返回非标 404；若「地址」层级的目录也缺失
+// （保存时预创建未完成、被外部清理等），只补对象键内的层级无法让重试成功。
 function imgbed_webdav_mkdir(array $cfg, string $key): void
 {
-    $parts = explode('/', trim($key, '/'));
-    array_pop($parts);
-    if (!$parts) return;
-    $headers = [];
     $w = $cfg['webdav'];
+    $u = parse_url(rtrim($w['base_url'], '/'));
+    if (!is_array($u) || empty($u['host'])) return;
+    $headers = [];
     if ($w['username'] !== '' || $w['password'] !== '') {
         $headers[] = 'Authorization: Basic ' . base64_encode($w['username'] . ':' . $w['password']);
     }
-    $path = rtrim($w['base_url'], '/');
-    foreach ($parts as $seg) {
+    $segments = array_values(array_filter(explode('/', trim((string)($u['path'] ?? ''), '/')), 'strlen'));
+    $key_parts = explode('/', trim($key, '/'));
+    array_pop($key_parts); // 去掉文件名，仅保留目录层级
+    $path = ($u['scheme'] ?? 'https') . '://' . $u['host'] . (isset($u['port']) ? ':' . (int)$u['port'] : '');
+    foreach (array_merge($segments, $key_parts) as $seg) {
         $path .= '/' . rawurlencode($seg);
         imgbed_http('MKCOL', $path, $headers, null, 30);
     }
@@ -310,6 +315,25 @@ function imgbed_public_url(array $cfg, string $key): string
             return rtrim($cfg['webdav']['base_url'], '/') . '/' . $key;
     }
     return '';
+}
+
+// 解析 php.ini 简写大小（2M / 512K / 1G 等）为字节；留空或 ≤0（PHP 的「不限制」写法）按不限制处理。
+function imgbed_ini_bytes(string $val): int
+{
+    $val = trim($val);
+    if ($val === '') return PHP_INT_MAX;
+    $unit = strtolower((string)substr($val, -1));
+    $num = (float)$val;
+    if ($unit === 'g') $num *= 1073741824;
+    elseif ($unit === 'm') $num *= 1048576;
+    elseif ($unit === 'k') $num *= 1024;
+    return $num <= 0 ? PHP_INT_MAX : (int)$num;
+}
+
+// 本环境单图有效上传上限：插件上限 10MB 与 PHP upload_max_filesize / post_max_size 取最小。
+function imgbed_upload_limit(): int
+{
+    return min(10485760, imgbed_ini_bytes((string)ini_get('upload_max_filesize')), imgbed_ini_bytes((string)ini_get('post_max_size')));
 }
 
 function imgbed_size_text(int $bytes): string
@@ -448,7 +472,13 @@ function imgbed_handle_upload(array $f, int $max_bytes = 10485760): array
     $cfg = imgbed_config();
     if (!imgbed_ready($cfg)) return ['ok' => 0, 'message' => '图床尚未配置完成，请到「后台 → 图床 → 设置」填写凭据'];
     if ((int)($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return ['ok' => 0, 'message' => '未收到上传文件'];
-    if ((int)$f['error'] !== UPLOAD_ERR_OK) return ['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）'];
+    if ((int)$f['error'] !== UPLOAD_ERR_OK) {
+        // 1 = UPLOAD_ERR_INI_SIZE：超过 php.ini 限制，给出可操作的明确提示（大图失败的最常见场景）。
+        if ((int)$f['error'] === UPLOAD_ERR_INI_SIZE) {
+            return ['ok' => 0, 'message' => '图片超过服务器上传上限（PHP upload_max_filesize = ' . ini_get('upload_max_filesize') . '）：请调大 php.ini 的 upload_max_filesize / post_max_size 后重启 PHP，或先压缩图片再上传'];
+        }
+        return ['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）'];
+    }
     if ((int)($f['size'] ?? 0) > $max_bytes) return ['ok' => 0, 'message' => '图片不能超过 ' . (int)round($max_bytes / 1048576) . 'MB'];
     $tmp = (string)($f['tmp_name'] ?? '');
     if ($tmp === '' || !is_uploaded_file($tmp)) return ['ok' => 0, 'message' => '非法的上传文件'];
@@ -479,14 +509,14 @@ function imgbed_upload_route(array $plugin): void
     need_admin();
     require_post();
     try {
-        json_response(imgbed_handle_upload(is_array($_FILES['file'] ?? null) ? $_FILES['file'] : []));
+        json_response(imgbed_handle_upload(is_array($_FILES['file'] ?? null) ? $_FILES['file'] : [], imgbed_upload_limit()));
     } catch (\Throwable $e) {
         error_log('[Mono imgbed] upload: ' . $e->getMessage());
         json_response(['ok' => 0, 'message' => '上传失败，请查看站点错误日志']);
     }
 }
 
-// --- 写文章页注入：工具栏「上传图片」按钮 + 隐藏文件选择框 ---
+// --- 写文章页注入：工具栏图片按钮（配置完成后由前端合并到核心「图片」按钮位置）+ 隐藏文件选择框 ---
 function imgbed_write_inject(string $value, array $ctx): string
 {
     try {
@@ -494,13 +524,19 @@ function imgbed_write_inject(string $value, array $ctx): string
         if ($title !== '写文章' && $title !== '编辑文章') return $value;
         if (!str_contains($value, '<span class="md-spacer"></span>')) return $value;
         if (str_contains($value, 'data-imgbed-open')) return $value;   // 幂等保护
-        $btn = '<button type="button" class="md-btn imgbed-open" data-imgbed-open="1" title="上传图片到图床并插入正文">'
-            . '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-            . '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>'
-            . '<span class="imgbed-label">上传图片</span></button>';
+        $ready = imgbed_ready(imgbed_config());
+        // 配置完成：与核心工具栏一致的「图片」文字按钮，前端 JS 将其插到核心「图片」按钮位置并隐藏后者；
+        // 未配置完成：保留原「上传图片」图标按钮，点击由前端引导去后台完成配置。
+        $btn = $ready
+            ? '<button type="button" class="md-btn imgbed-open" data-imgbed-open="1" data-imgbed-merged="1" title="插入图片：选择本地图片上传图床（可多选；也可直接 Ctrl+V 粘贴或拖入编辑区）">图片</button>'
+            : '<button type="button" class="md-btn imgbed-open" data-imgbed-open="1" title="上传图片到图床（尚未配置完成，点击查看引导）">'
+                . '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                . '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>'
+                . '<span class="imgbed-label">上传图片</span></button>';
         $value = str_replace('<span class="md-spacer"></span>', $btn . '<span class="md-spacer"></span>', $value);
-        $helper = '<input type="file" class="imgbed-file" accept="image/png,image/jpeg,image/gif,image/webp" hidden'
-            . ' data-url="' . h(route_url('imgbed_upload')) . '" data-csrf="' . h(csrf_token()) . '">';
+        $helper = '<input type="file" class="imgbed-file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden'
+            . ' data-url="' . h(route_url('imgbed_upload')) . '" data-csrf="' . h(csrf_token()) . '" data-ready="' . ($ready ? '1' : '0') . '"'
+            . ' data-max="' . imgbed_upload_limit() . '">';
         return str_replace('<div class="btn-row write-actions">', $helper . '<div class="btn-row write-actions">', $value);
     } catch (\Throwable $e) {
         error_log('[Mono imgbed] inject: ' . $e->getMessage());
@@ -627,7 +663,7 @@ function imgbed_admin_list(): string
     $html = '<div class="btn-row" style="justify-content:flex-end;margin-bottom:10px">'
         . '<a class="btn sm ghost" href="' . h(admin_url(['tab' => 'plugins', 'view' => 'imgbed'])) . '">图床设置</a></div>';
     if (!$rows) {
-        return $html . '<p style="color:var(--text-muted)">还没有上传记录。在写文章页点工具栏「上传图片」即可把图片传到图床。</p>';
+        return $html . '<p style="color:var(--text-muted)">还没有上传记录。在写文章页点工具栏「图片」按钮上传，或直接粘贴 / 拖拽图片到编辑区，即可把图片传到图床。</p>';
     }
     $html .= '<table class="list"><thead><tr><th>图片</th><th>文件名</th><th>大小</th><th>来源</th><th>时间</th><th class="actions">操作</th></tr></thead><tbody>';
     foreach ($rows as $r) {
@@ -831,6 +867,7 @@ function imgbed_css(): string
 .imgbed-code .btn{margin-top:8px}
 .imgbed-dialog-note{margin:0;color:var(--text-subtle);font-size:var(--font-size-xs);line-height:1.7}
 .imgbed-thumb{display:block;width:52px;height:52px;object-fit:cover;border:1px solid var(--border);border-radius:6px;background:var(--muted)}
+.md-editor.imgbed-drag{outline:2px dashed var(--brand);outline-offset:3px;border-radius:8px}
 CSS;
 }
 
@@ -839,6 +876,33 @@ function imgbed_js(): string
     return <<<'JS'
 (function () {
   'use strict';
+  // 站内提示：优先核心的 MonoAlert（与全站确认弹窗同款视觉），核心脚本未就绪时回退原生 alert。
+  function notice(msg) {
+    if (typeof window.MonoAlert === 'function') window.MonoAlert(msg);
+    else alert(msg);
+  }
+  // 复制文本：优先异步剪贴板 API；不可用 / 被拒时用隐藏文本框 + execCommand 兜底（同核心复制按钮），
+  // 仍失败则弹站内提示展示全文供手动复制。onOk 为成功反馈（如按钮短暂变「已复制」）。
+  function copyText(text, onOk) {
+    var legacy = function () {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      ta.remove();
+      if (ok) onOk();
+      else notice('复制失败，请手动复制：\n' + text);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(onOk, legacy);
+    } else {
+      legacy();
+    }
+  }
   // 在光标处插入文本（有选区则替换选区），并通知编辑器刷新统计 / 预览。
   function insertAt(ta, text) {
     var s = ta.selectionStart, e = ta.selectionEnd, v = ta.value;
@@ -847,59 +911,203 @@ function imgbed_js(): string
     ta.selectionStart = ta.selectionEnd = s + text.length;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  // 写文章页：工具栏按钮触发选图并上传，成功后插入 Markdown。
-  function bindUploader() {
+  // 精确替换文中片段（回填上传结果 / 清除失败占位）：不抢焦点、尽量保持用户光标位置；
+  // 找不到片段（用户已编辑过占位）时把内容追加到文末；目标为空时连同整行多余换行一并清掉。
+  function replaceAt(ta, find, text) {
+    var v = ta.value, i = v.indexOf(find), s, e;
+    if (i === -1) {
+      if (!text) return;
+      s = e = v.length;
+      text = (v !== '' && v.charAt(v.length - 1) !== '\n' ? '\n' : '') + text;
+    } else {
+      s = i;
+      e = i + find.length;
+      if (!text) {
+        if (v.charAt(e) === '\n') e += 1;
+        else if (s > 0 && v.charAt(s - 1) === '\n') s -= 1;
+      }
+    }
+    var focused = document.activeElement === ta;
+    var ss = ta.selectionStart, se = ta.selectionEnd;
+    ta.value = v.slice(0, s) + text + v.slice(e);
+    var delta = text.length - (e - s);
+    if (focused) {
+      var fix = function (p) { return p >= e ? p + delta : (p >= s ? s + text.length : p); };
+      ta.setSelectionRange(fix(ss), fix(se));
+    }
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  // 字节数转可读文本（预检提示用）。
+  function sizeText(n) {
+    if (n >= 1048576) return (Math.round(n / 104857.6) / 10) + 'MB';
+    if (n >= 1024) return Math.round(n / 1024) + 'KB';
+    return n + 'B';
+  }
+  // 从文件列表里挑出图片文件（按 MIME 前缀过滤）。
+  function imageFiles(list) {
+    var out = [];
+    Array.prototype.forEach.call(list || [], function (f) {
+      if (f && /^image\//.test(f.type || '')) out.push(f);
+    });
+    return out;
+  }
+  // 从剪贴板 / 拖拽的 DataTransfer 中收集图片文件（items 优先，files 兜底）。
+  function dndImages(dt) {
+    var out = [];
+    if (dt && dt.items) {
+      Array.prototype.forEach.call(dt.items, function (it) {
+        if (it.kind === 'file' && /^image\//.test(it.type || '')) {
+          var f = it.getAsFile();
+          if (f) out.push(f);
+        }
+      });
+    }
+    return out.length ? out : imageFiles(dt && dt.files);
+  }
+  // 上传单个文件（网络错误也归入 ok:0，由调用方统一处理）。
+  function uploadOne(file, cfg) {
+    var fd = new FormData();
+    fd.append('file', file);
+    fd.append('_csrf', cfg.csrf);
+    return fetch(cfg.url, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      body: fd
+    }).then(function (r) { return r.json(); }).catch(function () {
+      return { ok: 0, message: '网络错误，上传失败，请重试' };
+    });
+  }
+  // 串行上传并回填正文：先在当前光标处插入「上传中」占位（多张各占一行，上传期间可继续编辑），
+  // 成功后替换为 ![文件名](图床地址)，失败则清除占位并汇总提示。
+  function uploadIntoEditor(files, ctx) {
+    // 上限预检（ctx.max 由后台下发）：超限文件直接跳过并提示，避免无效上传（选图 / 粘贴 / 拖拽共用此入口）。
+    var over = [];
+    if (ctx.max > 0) {
+      files = files.filter(function (f) {
+        if (f.size > ctx.max) { over.push((f.name || '图片') + '（' + sizeText(f.size) + '）'); return false; }
+        return true;
+      });
+    }
+    if (over.length) notice('以下图片超过当前上限 ' + sizeText(ctx.max) + '，已跳过：\n' + over.join('\n'));
+    var items = files.slice(0).map(function (f) {
+      var tk = 'imgbed-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      return { file: f, ph: '![上传中](' + tk + ')' };
+    });
+    if (!items.length) return;
+    insertAt(ctx.ta, items.map(function (it) { return it.ph; }).join('\n'));
+    var total = items.length, done = 0, notes = [];
+    ctx.setBusy(true, 0, total);
+    var next = function () {
+      if (!items.length) {
+        ctx.setBusy(false, total, total);
+        if (notes.length) notice(notes.join('\n'));
+        return;
+      }
+      var it = items.shift();
+      uploadOne(it.file, ctx.cfg).then(function (res) {
+        done += 1;
+        if (res && res.ok === 1) {
+          replaceAt(ctx.ta, it.ph, '![' + (res.name || 'image') + '](' + res.url + ')');
+          if (res.note) notes.push(res.note);
+        } else {
+          replaceAt(ctx.ta, it.ph, '');
+          notes.push((res && res.message) || '上传失败，请重试');
+        }
+        ctx.setBusy(true, done, total);
+        next();
+      });
+    };
+    next();
+  }
+  // 写文章页：图片按钮（配置完成后与核心「图片」按钮合并）+ 选图多选上传 + 粘贴 / 拖拽图片直传。
+  function bindEditorUpload() {
     var btn = document.querySelector('[data-imgbed-open]');
     var input = document.querySelector('.imgbed-file');
-    if (!btn || !input) return;
-    var ta = document.querySelector('.md-editor textarea');
-    if (!ta) return;
-    var label = btn.querySelector('.imgbed-label');
-    var idle = label ? label.textContent : '';
-    var busy = false;
+    var editor = document.querySelector('.md-editor');
+    var ta = editor ? editor.querySelector('textarea') : null;
+    if (!btn || !input || !editor || !ta) return;
+    var ready = input.getAttribute('data-ready') === '1';
+    var idleText = btn.textContent;
+    var ctx = {
+      ta: ta,
+      cfg: { url: input.getAttribute('data-url') || '', csrf: input.getAttribute('data-csrf') || '' },
+      max: parseInt(input.getAttribute('data-max') || '', 10) || 0,
+      setBusy: function (busy, done, total) {
+        if (busy) {
+          btn.disabled = true;
+          btn.textContent = total > 1 && done > 0 ? '上传中 ' + done + '/' + total : '上传中…';
+        } else {
+          btn.disabled = false;
+          btn.textContent = idleText;
+        }
+      }
+    };
     btn.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();   // 核心编辑器对 .md-btn 有全局点击委托，阻止其接管
-      if (!busy) input.click();
+      if (!ready) { notice('图床尚未配置完成，请到「后台 → 图床 → 设置」填写凭据后再上传'); return; }
+      input.click();
     });
     input.addEventListener('change', function () {
-      var file = input.files && input.files[0];
+      var files = imageFiles(input.files);
       input.value = '';
-      if (!file) return;
-      busy = true;
-      btn.disabled = true;
-      if (label) label.textContent = '上传中…';
-      var restore = function () { busy = false; btn.disabled = false; if (label) label.textContent = idle; };
-      var fd = new FormData();
-      fd.append('file', file);
-      fd.append('_csrf', input.getAttribute('data-csrf') || '');
-      fetch(input.getAttribute('data-url'), {
-        method: 'POST',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-        body: fd
-      }).then(function (r) { return r.json(); }).then(function (res) {
-        if (!res || res.ok !== 1) { alert((res && res.message) || '上传失败，请重试'); return; }
-        insertAt(ta, '![' + (res.name || 'image') + '](' + res.url + ')');
-        if (res.note) alert(res.note);
-      }).catch(function () { alert('网络错误，上传失败，请重试'); }).then(restore);
+      uploadIntoEditor(files, ctx);
+    });
+    // 与核心「图片」按钮合并：接管其工具栏位置，原按钮隐藏；找不到时保持原位不动，功能不受影响。
+    if (btn.getAttribute('data-imgbed-merged') === '1') {
+      var core = editor.querySelector('.md-btn[data-md="image"]');
+      if (core && core.parentNode) {
+        core.parentNode.insertBefore(btn, core);
+        core.hidden = true;
+      }
+    }
+    if (!ready) return;
+    // 粘贴：剪贴板含图片文件（截图 / 复制图像）时直传图床；纯文本粘贴不受影响。
+    ta.addEventListener('paste', function (e) {
+      var files = dndImages(e.clipboardData);
+      if (!files.length) return;
+      e.preventDefault();
+      uploadIntoEditor(files, ctx);
+    });
+    // 拖拽：图片文件拖入编辑区直传；含文件的一律拦截默认行为，防止浏览器打开文件离开页面丢失草稿。
+    var hasFiles = function (e) {
+      var t = (e.dataTransfer && e.dataTransfer.types) || [];
+      for (var i = 0; i < t.length; i++) if (t[i] === 'Files') return true;
+      return false;
+    };
+    var depth = 0;
+    editor.addEventListener('dragenter', function (e) { if (hasFiles(e)) depth += 1; });
+    editor.addEventListener('dragover', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      editor.classList.add('imgbed-drag');
+    });
+    editor.addEventListener('dragleave', function () {
+      depth = Math.max(0, depth - 1);
+      if (!depth) editor.classList.remove('imgbed-drag');
+    });
+    editor.addEventListener('drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      editor.classList.remove('imgbed-drag');
+      var files = imageFiles(e.dataTransfer && e.dataTransfer.files);
+      if (!files.length) { notice('仅支持拖入图片文件（PNG / JPG / GIF / WebP）'); return; }
+      uploadIntoEditor(files, ctx);
     });
   }
-  // 后台「图床」列表：复制链接（不可用时回退为手动复制弹窗）。
+  // 后台「图床」列表：复制链接（剪贴板不可用时自动降级，仍失败弹站内提示）。
   function bindCopy() {
     document.addEventListener('click', function (e) {
       var btn = e.target && e.target.closest ? e.target.closest('[data-imgbed-copy]') : null;
       if (!btn) return;
-      var url = btn.getAttribute('data-imgbed-copy') || '';
       var flash = function () {
         var old = btn.textContent;
         btn.textContent = '已复制';
         setTimeout(function () { btn.textContent = old; }, 1500);
       };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).then(flash, function () { window.prompt('复制链接：', url); });
-      } else {
-        window.prompt('复制链接：', url);
-      }
+      copyText(btn.getAttribute('data-imgbed-copy') || '', flash);
     });
   }
   // 配置页：凭据区只显示当前选中源；其余块 hidden 但仍随表单提交（切换源不丢数据），切换即时显隐。
@@ -935,17 +1143,12 @@ function imgbed_js(): string
       var copy = t.closest('[data-imgbed-copy-code]');
       if (!copy) return;
       var codeEl = dlg.querySelector('[data-imgbed-code]');
-      var text = codeEl ? codeEl.textContent : '';
       var flash = function () { var old = copy.textContent; copy.textContent = '已复制'; setTimeout(function () { copy.textContent = old; }, 1500); };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(flash, function () { window.prompt('复制代码：', text); });
-      } else {
-        window.prompt('复制代码：', text);
-      }
+      copyText(codeEl ? codeEl.textContent : '', flash);
     });
     dlg.addEventListener('click', function (e) { if (e.target === dlg) close(); });
   }
-  function init() { bindUploader(); bindCopy(); bindSourceSwitch(); bindDialog(); }
+  function init() { bindEditorUpload(); bindCopy(); bindSourceSwitch(); bindDialog(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 }());
@@ -955,8 +1158,8 @@ JS;
 return [
     'id' => 'imgbed',
     'name' => '图床',
-    'version' => '1.0.0',
-    'description' => '写作图片一键上传到外部图床（阿里云 OSS / 腾讯云 COS / Cloudflare R2 / WebDAV）：写文章页上传后自动插入正文，支持去 EXIF（默认开）与自动压缩（默认关），后台可浏览与管理已上传图片。',
+    'version' => '1.1.3',
+    'description' => '写作图片一键上传到外部图床（阿里云 OSS / 腾讯云 COS / Cloudflare R2 / WebDAV）：写文章页「图片」按钮一键选图（可多选）上传并插入正文，支持直接粘贴截图 / 拖拽图片到编辑区自动上传，去 EXIF（默认开）与自动压缩（默认关），后台可浏览与管理已上传图片。',
     'author' => 'Mono',
     'assets' => ['css' => 'imgbed_css', 'js' => 'imgbed_js'],
     'hooks' => [

@@ -1,3 +1,5 @@
 # git archive（部署包）排除规则
 # 目录级规则即可整目录剔除（连目录项一起）；/scripts/** 写法会残留空目录项（已实测）
 /scripts export-ignore
+/docs export-ignore
+/CHANGELOG.md export-ignore

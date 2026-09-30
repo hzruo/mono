@@ -54,14 +54,23 @@ final class Setup
         $driver = (string)($_POST['driver'] ?? 'sqlite');
         if (!in_array($driver, ['sqlite', 'mysql', 'pgsql'], true)) $driver = 'sqlite';
         $config = ['driver' => $driver];
+        // 连接字段统一 trim：粘贴来源常带首尾空白，原样使用时 MySQL / PG 会报「Unknown database ' xxx '」
+        // 这类难以定位的错误（SQLite 则生成带空格的文件名）；空值回退默认。
         if ($driver === 'sqlite') {
-            $config['database'] = (string)($_POST['db_name'] ?? '') !== '' ? (string)$_POST['db_name'] : 'blog.sqlite';
+            $name = trim((string)($_POST['db_name'] ?? ''));
+            $config['database'] = $name !== '' ? $name : 'blog.sqlite';
         } else {
-            $config['host'] = (string)($_POST['host'] ?? '127.0.0.1');
-            $config['port'] = (string)($_POST['port'] ?? ($driver === 'mysql' ? '3306' : '5432'));
-            $config['database'] = (string)($_POST['database'] ?? '');
-            $config['username'] = (string)($_POST['username'] ?? '');
-            $config['password'] = (string)($_POST['password'] ?? '');
+            $host = trim((string)($_POST['host'] ?? ''));
+            $port = trim((string)($_POST['port'] ?? ''));
+            $config['host'] = $host !== '' ? $host : '127.0.0.1';
+            $config['port'] = $port !== '' ? $port : ($driver === 'mysql' ? '3306' : '5432');
+            $config['database'] = trim((string)($_POST['database'] ?? ''));
+            $config['username'] = trim((string)($_POST['username'] ?? ''));
+            $config['password'] = trim((string)($_POST['password'] ?? ''));
+            if ($config['database'] === '') {
+                self::install_page('请填写数据库名（MySQL / PostgreSQL 需提前建好该数据库）。');
+                exit;
+            }
         }
 
         $nickname = trim((string)($_POST['nickname'] ?? ''));

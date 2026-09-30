@@ -116,6 +116,46 @@
     });
   }
 
+  // —— 站内提示弹窗（window.MonoAlert，替代浏览器原生 alert）——
+  // 插件 / 页面脚本调用 window.MonoAlert('文案') 即弹出与确认弹窗同款样式的提示框：
+  // 单按钮「知道了」，Enter / Esc / 点遮罩均可关闭，支持多行文案（长链接自动断行）。
+  var alertUI = null;
+
+  function ensureAlertUI() {
+    if (alertUI) return alertUI;
+    var mask = document.createElement('div');
+    mask.className = 'confirm-mask';
+    mask.hidden = true;
+    mask.innerHTML = '<div class="confirm-box" role="alertdialog" aria-modal="true">'
+      + '<p class="confirm-msg"></p>'
+      + '<div class="confirm-actions">'
+      + '<button type="button" class="btn sm" data-role="ok">知道了</button>'
+      + '</div></div>';
+    document.body.appendChild(mask);
+    alertUI = {
+      mask: mask,
+      msg: mask.querySelector('.confirm-msg'),
+      ok: mask.querySelector('[data-role="ok"]')
+    };
+    function close() { mask.hidden = true; }
+    alertUI.ok.addEventListener('click', close);
+    mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
+    document.addEventListener('keydown', function (e) {
+      if (!mask.hidden && e.key === 'Escape') { e.preventDefault(); close(); }
+    });
+    return alertUI;
+  }
+
+  // 打开（或更新）提示弹窗；textContent 赋值不解析 HTML，文案可安全包含用户数据。
+  function showAlert(msg) {
+    var ui = ensureAlertUI();
+    ui.msg.textContent = msg;
+    ui.mask.hidden = false;
+    ui.ok.focus();
+  }
+
+  window.MonoAlert = showAlert;
+
   // 代码块复制按钮：读取同容器内 <pre><code> 的纯文本写入剪贴板。
   function bindCodeCopy() {
     document.addEventListener('click', function (e) {

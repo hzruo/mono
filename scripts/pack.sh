@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-# MiniBlog 部署包构建脚本
+# Monoblog 部署包构建脚本
 #
 # 用法：bash scripts/pack.sh [--force]
 #   --force  工作区存在未提交的跟踪改动时仍继续（改动不会进入包）
 #
-# 产物：dist/miniblog-v<版本>-<日期>.zip
+# 产物：dist/monoblog-v<版本>-<日期>.zip
 #   - 由 git archive HEAD 生成：只含 git 跟踪文件，天然排除运行时数据
 #     （app/data/、.env、plugins.css|js 合并产物、.git、系统文件）
-#   - scripts/ 经 .gitattributes export-ignore 排除，不进部署包
+#   - scripts/、docs/、CHANGELOG.md 经 .gitattributes export-ignore 排除，不进部署包
 #   - 无顶层前缀目录，解压即得网站根内容（上传至网站根目录后自动安装）
 # ------------------------------------------------------------------
 set -euo pipefail
@@ -32,17 +32,17 @@ if [ -n "$DIRTY" ]; then
     fi
 fi
 
-# 3. 生成部署包
+# 3. 生成部署包（--worktree-attributes：让工作区中未提交的 .gitattributes 排除规则也即时生效）
 DATE="$(date +%Y%m%d)"
-OUT="dist/miniblog-v${VERSION}-${DATE}.zip"
+OUT="dist/monoblog-v${VERSION}-${DATE}.zip"
 mkdir -p dist
-git archive --format=zip -o "$OUT" HEAD
+git archive --worktree-attributes --format=zip -o "$OUT" HEAD
 
 # 4. 校验包内清单
 LIST="$(unzip -Z1 "$OUT")"
 
 # 4.1 必须排除：运行时数据 / 密钥 / 合并产物 / 开发脚本 / 系统文件
-EXCLUDE_PAT='^app/data/|^\.env$|^app/assets/plugins\.(css|js)$|^\.git/|^scripts/|DS_Store'
+EXCLUDE_PAT='^app/data/|^\.env$|^app/assets/plugins\.(css|js)$|^\.git/|^scripts/|^docs/|^CHANGELOG\.md$|DS_Store'
 BAD="$(printf '%s\n' "$LIST" | grep -E "$EXCLUDE_PAT" || true)"
 if [ -n "$BAD" ]; then
     echo "错误：部署包出现应排除的文件：" >&2
@@ -66,5 +66,5 @@ echo "部署包生成成功"
 echo "  产物：${OUT}"
 echo "  版本：v${VERSION}（提交 $(git rev-parse --short HEAD)）"
 echo "  文件：${FILES} 个，${SIZE} 字节"
-echo "  排除：app/data、.env、plugins.css|js、.git、scripts/、系统文件"
+echo "  排除：app/data、.env、plugins.css|js、.git、scripts/、docs/、CHANGELOG.md、系统文件"
 echo "  部署：解压到网站根目录 → 访问域名自动安装"

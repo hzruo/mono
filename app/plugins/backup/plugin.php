@@ -9,8 +9,10 @@ if (!defined('APP_ROOT')) exit;
  *   SQLite 用 `VACUUM INTO` 生成一致性快照（兼容 WAL，失败退回文件复制），支持整库一键还原；
  *   MySQL / PostgreSQL 导出「全表 JSON 数据快照」（结构不备份），还原时按表覆盖数据：
  *   目标库缺失的表自动跳过并提示，列不一致时按同名列取交集写入。
- * - 备份文件落盘 DATA_DIR/backups/，按保留份数自动清理旧文件。
- * - 渠道（可同时启用）：邮箱（原生 SMTP + MIME 附件，支持 SSL/STARTTLS）、WebDAV（PUT 上传）。
+ * - 备份文件落盘 DATA_DIR/backups/（可选 gzip 压缩为 .gz），按保留份数自动清理旧文件。
+ * - 渠道（可同时启用）：邮箱（原生 SMTP + MIME 附件，支持 SSL/STARTTLS）、WebDAV（PUT 上传，
+ *   目录缺失时逐级 MKCOL 补建后重试；兼容 TeraCloud / InfiniCLOUD 非标 403 与 Koofr 非标 404；
+ *   上传成功后 PROPFIND 列目录，按同份数删除远端多余的旧备份）。
  * - cron scheduled：按配置间隔（每小时/6 小时/每天/每周）自动备份并推送渠道。
  * - 后台：立即备份、文件列表（下载 / 还原 / 删除）、上传还原、渠道与计划配置。
  * - route backup_download：管理员下载本地备份文件（文件名白名单校验）。
@@ -31,6 +33,7 @@ function backup_config(): array
         'schedule_enabled' => (int)($raw['schedule_enabled'] ?? 0) === 1,
         'schedule_interval' => $interval,
         'keep_files' => min(50, max(1, (int)($raw['keep_files'] ?? 10))),
+        'compress' => (int)($raw['compress'] ?? 1) === 1,
         'email_enabled' => (int)($raw['email_enabled'] ?? 0) === 1,
         'smtp_host' => (string)($raw['smtp_host'] ?? ''),
         'smtp_port' => min(65535, max(1, (int)($raw['smtp_port'] ?? 465))),
@@ -40,9 +43,10 @@ function backup_config(): array
         'mail_from' => (string)($raw['mail_from'] ?? ''),
         'mail_to' => (string)($raw['mail_to'] ?? ''),
         'webdav_enabled' => (int)($raw['webdav_enabled'] ?? 0) === 1,
-        'webdav_url' => (string)($raw['webdav_url'] ?? ''),
-        'webdav_user' => (string)($raw['webdav_user'] ?? ''),
-        'webdav_pass' => (string)($raw['webdav_pass'] ?? ''),
+        // trim：表单粘贴常带首尾空白，直接参与 HTTP 认证会静默 401（imgbed 读取配置时同样先 trim）。
+        'webdav_url' => trim((string)($raw['webdav_url'] ?? '')),
+        'webdav_user' => trim((string)($raw['webdav_user'] ?? '')),
+        'webdav_pass' => trim((string)($raw['webdav_pass'] ?? '')),
     ];
 }
 
@@ -70,7 +74,7 @@ function backup_ensure_dir(): bool
 // 合法备份文件名（含还原留底文件），返回绝对路径，非法返回空串。
 function backup_file_by_name(string $name): string
 {
-    if (preg_match('/^(backup|pre-restore)-\d{8}-\d{6}(-[a-f0-9]{6})?\.(sqlite|json)$/', $name) !== 1) return '';
+    if (preg_match('/^(backup|pre-restore)-\d{8}-\d{6}(-[a-f0-9]{6})?\.(sqlite|json)(\.gz)?$/', $name) !== 1) return '';
     $path = backup_dir() . '/' . $name;
     return is_file($path) ? $path : '';
 }
@@ -82,7 +86,7 @@ function backup_list_files(): array
     foreach (glob(backup_dir() . '/*') ?: [] as $path) {
         if (!is_file($path)) continue;
         $name = basename($path);
-        if (!preg_match('/^(backup|pre-restore)-\d{8}-\d{6}(-[a-f0-9]{6})?\.(sqlite|json)$/', $name)) continue;
+        if (!preg_match('/^(backup|pre-restore)-\d{8}-\d{6}(-[a-f0-9]{6})?\.(sqlite|json)(\.gz)?$/', $name)) continue;
         $items[] = ['name' => $name, 'path' => $path, 'size' => (int)filesize($path), 'time' => (int)filemtime($path)];
     }
     usort($items, static fn(array $a, array $b): int => $b['time'] <=> $a['time']);
@@ -132,8 +136,8 @@ function backup_table_columns(string $table): array
     return $cols;
 }
 
-// 生成备份文件。返回 [ok, 文件路径, 错误信息]。
-function backup_create(): array
+// 生成备份文件（可选 gzip 压缩）。返回 [ok, 文件路径, 错误信息]。
+function backup_create(array $cfg): array
 {
     if (!backup_ensure_dir()) return [false, '', '备份目录不可写：' . backup_dir()];
     $stamp = date('Ymd-His');
@@ -151,23 +155,69 @@ function backup_create(): array
             if (!@copy($source, $file)) return [false, '', '复制数据库文件失败（请检查目录写权限）'];
         }
         if (!is_file($file) || filesize($file) < 1) return [false, '', '备份文件生成失败'];
-        return [true, $file, ''];
+    } else {
+        // 非 SQLite：导出全表 JSON 数据快照。
+        $file = backup_dir() . '/backup-' . $stamp . '-' . $rand . '.json';
+        try {
+            $tables = [];
+            foreach (backup_list_tables() as $t) $tables[$t] = all('SELECT * FROM ' . app_db_identifier(db_driver(), $t));
+            $payload = ['format' => 'mono-backup', 'version' => 1, 'driver' => db_driver(), 'created_at' => now(), 'tables' => $tables];
+            if (file_put_contents($file, (string)json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) === false) {
+                return [false, '', '写入备份文件失败'];
+            }
+        } catch (\Throwable $e) {
+            @unlink($file);
+            return [false, '', '导出数据失败：' . $e->getMessage()];
+        }
     }
 
-    // 非 SQLite：导出全表 JSON 数据快照。
-    $file = backup_dir() . '/backup-' . $stamp . '-' . $rand . '.json';
-    try {
-        $tables = [];
-        foreach (backup_list_tables() as $t) $tables[$t] = all('SELECT * FROM ' . app_db_identifier(db_driver(), $t));
-        $payload = ['format' => 'mono-backup', 'version' => 1, 'driver' => db_driver(), 'created_at' => now(), 'tables' => $tables];
-        if (file_put_contents($file, (string)json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) === false) {
-            return [false, '', '写入备份文件失败'];
+    // 可选 gzip 压缩（新文件为 .gz）：压缩失败回退保留原始文件，不阻断备份。
+    if ($cfg['compress']) {
+        $gz = $file . '.gz';
+        if (backup_gzip_file($file, $gz)) {
+            @unlink($file);
+            $file = $gz;
+        } else {
+            @unlink($gz);
+            error_log('[Mono backup] gzip 压缩失败，保留未压缩文件：' . basename($file));
         }
-    } catch (\Throwable $e) {
-        @unlink($file);
-        return [false, '', '导出数据失败：' . $e->getMessage()];
     }
     return [true, $file, ''];
+}
+
+// gzip 流式压缩（分块读写，避免大备份整读进内存）；失败返回 false，由调用方回退保留原文件。
+function backup_gzip_file(string $src, string $dst): bool
+{
+    $in = @fopen($src, 'rb');
+    if (!$in) return false;
+    $out = @gzopen($dst, 'wb6');
+    if (!$out) { fclose($in); return false; }
+    $ok = true;
+    while (!feof($in)) {
+        $chunk = fread($in, 262144);
+        if ($chunk === false || ($chunk !== '' && gzwrite($out, $chunk) === false)) { $ok = false; break; }
+    }
+    fclose($in);
+    if (!gzclose($out)) $ok = false;
+    return $ok && is_file($dst) && (int)filesize($dst) > 0;
+}
+
+// gzip 流式解压（供 .gz 备份还原）；数据损坏或非 gzip 内容返回 false。
+function backup_gunzip_file(string $src, string $dst): bool
+{
+    $in = @gzopen($src, 'rb');
+    if (!$in) return false;
+    $out = @fopen($dst, 'wb');
+    if (!$out) { gzclose($in); return false; }
+    $ok = true;
+    while (!gzeof($in)) {
+        $chunk = @gzread($in, 262144);
+        if ($chunk === false) { $ok = false; break; }
+        if ($chunk !== '' && fwrite($out, $chunk) === false) { $ok = false; break; }
+    }
+    gzclose($in);
+    if (!fclose($out)) $ok = false;
+    return $ok;
 }
 
 // 仅保留最近 N 份 backup-*（pre-restore-* 留底文件不参与清理）。
@@ -191,7 +241,7 @@ function backup_dispatch(array $cfg, string $file): array
 // 执行一次完整备份（生成 + 推送 + 清理 + 记录），返回 [是否全部成功, 摘要]。
 function backup_run(array $cfg): array
 {
-    [$ok, $file, $err] = backup_create();
+    [$ok, $file, $err] = backup_create($cfg);
     if (!$ok) {
         backup_record_last(false, '', '备份失败：' . $err);
         return [false, '备份失败：' . $err];
@@ -328,17 +378,22 @@ function backup_send_webdav(array $cfg, string $file): array
     $name = basename($file);
     $url = rtrim($cfg['webdav_url'], '/') . '/' . rawurlencode($name);
     [$ok, $status, $err] = backup_webdav_put($cfg, $url, $file);
-    if (!$ok && $status === 409) {
-        // 目录不存在：逐级 MKCOL 后重试一次。
+    // 目录不存在：逐级 MKCOL 后重试一次。标准实现 PUT 到缺失父目录返回 409；非标实现返回 403（TeraCloud / InfiniCLOUD）或 404（Koofr），一并处理。
+    if (!$ok && in_array($status, [403, 404, 409], true)) {
         backup_webdav_mkcol($cfg);
         [$ok, $status, $err] = backup_webdav_put($cfg, $url, $file);
     }
-    if ($ok) return [true, '已上传 ' . $name];
-    if ($status === 401 || $status === 403) return [false, '认证失败（HTTP ' . $status . '），请检查账号密码'];
+    if ($ok) {
+        // 上传成功后按「保留份数」同步清理远端旧备份（列目录失败 / 服务器不支持 PROPFIND / 单份删除失败均静默，不影响上传结果）。
+        $removed = backup_webdav_prune($cfg, $cfg['keep_files']);
+        return [true, '已上传 ' . $name . ($removed > 0 ? '；远端清理旧备份 ' . $removed . ' 份' : '')];
+    }
+    if ($status === 401) return [false, '认证失败（HTTP 401），请检查账号密码'];
+    if ($status === 403) return [false, '无写入权限或目录无法创建（HTTP 403），请检查账号密码与目录 URL'];
     return [false, '上传失败（HTTP ' . $status . ($err !== '' ? '：' . $err : '') . '）'];
 }
 
-function backup_webdav_request(array $cfg, string $url, string $method, ?string $body): array
+function backup_webdav_request(array $cfg, string $url, string $method, ?string $body, array $headers = []): array
 {
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
@@ -347,20 +402,30 @@ function backup_webdav_request(array $cfg, string $url, string $method, ?string 
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_TIMEOUT => 60,
-            CURLOPT_HTTPAUTH => CURLAUTH_ANY,
         ];
         if ($body !== null) $opts[CURLOPT_POSTFIELDS] = $body;
-        if ($cfg['webdav_user'] !== '') $opts[CURLOPT_USERPWD] = $cfg['webdav_user'] . ':' . $cfg['webdav_pass'];
+        $hdrs = [];
+        // 预先携带 Basic 认证（与 stream 兜底及 imgbed 一致）：不用 CURLAUTH_ANY 挑战重试，避免多余的 401 往返。
+        if ($cfg['webdav_user'] !== '' || $cfg['webdav_pass'] !== '') {
+            $hdrs[] = 'Authorization: Basic ' . base64_encode($cfg['webdav_user'] . ':' . $cfg['webdav_pass']);
+        }
+        foreach ($headers as $h) $hdrs[] = $h;
+        if ($hdrs) $opts[CURLOPT_HTTPHEADER] = $hdrs;
         curl_setopt_array($ch, $opts);
         $resp = curl_exec($ch);
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $err = $resp === false ? (string)curl_error($ch) : '';
         curl_close($ch);
-        return [$err === '' && $status >= 200 && $status < 300, $status, $err];
+        return [$err === '' && $status >= 200 && $status < 300, $status, $err, $resp === false ? '' : (string)$resp];
     }
+    $hdrs = [];
+    if ($cfg['webdav_user'] !== '' || $cfg['webdav_pass'] !== '') {
+        $hdrs[] = 'Authorization: Basic ' . base64_encode($cfg['webdav_user'] . ':' . $cfg['webdav_pass']);
+    }
+    foreach ($headers as $h) $hdrs[] = $h;
     $ctx = stream_context_create(['http' => [
         'method' => $method,
-        'header' => $cfg['webdav_user'] !== '' ? ('Authorization: Basic ' . base64_encode($cfg['webdav_user'] . ':' . $cfg['webdav_pass'])) : '',
+        'header' => $hdrs ? implode("\r\n", $hdrs) : '',
         'content' => (string)$body,
         'timeout' => 60,
         'ignore_errors' => true,
@@ -370,7 +435,7 @@ function backup_webdav_request(array $cfg, string $url, string $method, ?string 
     foreach ((array)($http_response_header ?? []) as $line) {
         if (preg_match('#^HTTP/\S+\s+(\d{3})#', (string)$line, $m)) $status = (int)$m[1];
     }
-    return [$resp !== false && $status >= 200 && $status < 300, $status, $resp === false ? '网络错误' : ''];
+    return [$resp !== false && $status >= 200 && $status < 300, $status, $resp === false ? '网络错误' : '', $resp === false ? '' : (string)$resp];
 }
 
 function backup_webdav_put(array $cfg, string $url, string $file): array
@@ -388,9 +453,12 @@ function backup_webdav_put(array $cfg, string $url, string $file): array
             CURLOPT_TIMEOUT => 300,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS => 3,
-            CURLOPT_HTTPAUTH => CURLAUTH_ANY,
         ];
-        if ($cfg['webdav_user'] !== '') $opts[CURLOPT_USERPWD] = $cfg['webdav_user'] . ':' . $cfg['webdav_pass'];
+        // 预先携带 Basic 认证：不可用 CURLAUTH_ANY——认证挑战要求重发请求体，而 CURLOPT_INFILE 的
+        // PHP 流无法回退（curl 报 necessary data rewind，且 getinfo 取到挑战态的 401 被误判为密码错误）。
+        if ($cfg['webdav_user'] !== '' || $cfg['webdav_pass'] !== '') {
+            $opts[CURLOPT_HTTPHEADER] = ['Authorization: Basic ' . base64_encode($cfg['webdav_user'] . ':' . $cfg['webdav_pass'])];
+        }
         curl_setopt_array($ch, $opts);
         $resp = curl_exec($ch);
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -423,6 +491,45 @@ function backup_webdav_mkcol(array $cfg): void
         $built .= '/' . $seg;
         backup_webdav_request($cfg, $base . $built, 'MKCOL', null);
     }
+}
+
+// 列出 WebDAV 目录里本插件生成的备份文件名（PROPFIND Depth:1，返回新 → 旧）。
+// 兼容多种实现：href 允许任意命名空间前缀、完整 URL 或路径形式、无尾斜杠（Koofr）；只认严格
+// backup-* 文件名的条目，目录项与其它文件天然被过滤。请求 / 解析 / 服务器不支持 PROPFIND 等
+// 任何失败一律返回空数组，由调用方静默跳过。
+function backup_webdav_list_backups(array $cfg): array
+{
+    $url = rtrim($cfg['webdav_url'], '/') . '/';
+    $body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/></d:prop></d:propfind>';
+    [$ok, , , $resp] = backup_webdav_request($cfg, $url, 'PROPFIND', $body, ['Depth: 1', 'Content-Type: application/xml; charset=utf-8']);
+    if (!$ok || $resp === '') return [];
+    $names = [];
+    if (preg_match_all('#<[^>]*href[^>]*>([^<]+)</[^>]*href>#i', $resp, $m)) {
+        foreach ($m[1] as $href) {
+            $name = rawurldecode(basename(rtrim(trim($href), '/')));
+            if (preg_match('/^backup-\d{8}-\d{6}-[a-f0-9]{6}\.(sqlite|db|json)(\.gz)?$/', $name)) $names[] = $name;
+        }
+    }
+    $names = array_values(array_unique($names));
+    rsort($names); // 文件名内嵌时间戳，逆字典序即新 → 旧
+    return $names;
+}
+
+// WebDAV 远端保留份数清理：与本地同规则，仅保留最近 N 份 backup-*，删除多余旧文件；返回删除数量。
+// 安全边界：删除目标一律用「白名单校验过的文件名重新拼接 URL」，不直接跟随响应里的 href；
+// 逐个删除失败仅记日志不中断，任何异常都不影响备份与上传结果。
+function backup_webdav_prune(array $cfg, int $keep): int
+{
+    $names = backup_webdav_list_backups($cfg);
+    if (count($names) <= $keep) return 0;
+    $base = rtrim($cfg['webdav_url'], '/') . '/';
+    $removed = 0;
+    foreach (array_slice($names, $keep) as $name) {
+        [$ok, $status] = backup_webdav_request($cfg, $base . rawurlencode($name), 'DELETE', null);
+        if ($ok) $removed++;
+        else error_log('[Mono backup] WebDAV 远端旧备份删除失败（HTTP ' . $status . '）：' . $name);
+    }
+    return $removed;
 }
 
 // --- 还原 ---
@@ -522,11 +629,30 @@ function backup_restore_json(string $source): array
     return [true, $msg];
 }
 
+// 还原入口：.gz 先解压到临时文件再还原，解压产物按内容分流（上传文件的 tmp 名无扩展名，不能依赖扩展名判断）。
 function backup_restore_file(string $path): array
 {
-    return strtolower((string)pathinfo($path, PATHINFO_EXTENSION)) === 'json'
-        ? backup_restore_json($path)
-        : backup_restore_sqlite($path);
+    if (strtolower((string)pathinfo($path, PATHINFO_EXTENSION)) === 'gz') {
+        if ((string)@file_get_contents($path, false, null, 0, 2) !== "\x1f\x8b") return [false, '不是有效的 gzip 压缩文件'];
+        if (!backup_ensure_dir()) return [false, '备份目录不可写，无法解压备份文件'];
+        $tmp = backup_dir() . '/.restore-unpack-' . bin2hex(random_bytes(4)) . '.tmp';
+        if (!backup_gunzip_file($path, $tmp) || (int)@filesize($tmp) < 1) {
+            @unlink($tmp);
+            return [false, '解压备份文件失败'];
+        }
+        [$ok, $msg] = backup_restore_payload($tmp);
+        @unlink($tmp);
+        return [$ok, $msg];
+    }
+    return backup_restore_payload($path);
+}
+
+// 按内容分流：SQLite 文件头走整库还原，否则按 Mono JSON 数据快照处理。
+function backup_restore_payload(string $path): array
+{
+    return strncmp((string)@file_get_contents($path, false, null, 0, 16), "SQLite format 3\0", 16) === 0
+        ? backup_restore_sqlite($path)
+        : backup_restore_json($path);
 }
 
 // --- 路由与 cron ---
@@ -578,6 +704,7 @@ function backup_admin(array $plugin): string
                 'schedule_enabled' => (int)($_POST['schedule_enabled'] ?? 0) === 1 ? 1 : 0,
                 'schedule_interval' => (string)($_POST['schedule_interval'] ?? 'daily'),
                 'keep_files' => (string)min(50, max(1, (int)($_POST['keep_files'] ?? 10))),
+                'compress' => (int)($_POST['compress'] ?? 1) === 1 ? 1 : 0,
                 'email_enabled' => (int)($_POST['email_enabled'] ?? 0) === 1 ? 1 : 0,
                 'smtp_host' => post('smtp_host', 200),
                 'smtp_port' => (string)min(65535, max(1, (int)($_POST['smtp_port'] ?? 465))),
@@ -628,7 +755,7 @@ function backup_admin(array $plugin): string
             $tmp = (string)$f['tmp_name'];
             if (!is_uploaded_file($tmp)) { set_flash('非法的上传文件', 'error'); go($back); }
             $ext = strtolower((string)pathinfo((string)$f['name'], PATHINFO_EXTENSION));
-            if (!in_array($ext, ['sqlite', 'db', 'json'], true)) { set_flash('仅支持 .sqlite / .db / .json 备份文件', 'error'); go($back); }
+            if (!in_array($ext, ['sqlite', 'db', 'json', 'gz'], true)) { set_flash('仅支持 .sqlite / .db / .json / .gz 备份文件', 'error'); go($back); }
             [$ok, $msg] = backup_restore_file($tmp);
             set_flash(($ok ? '' : '还原失败：') . $msg, $ok ? 'ok' : 'error');
             go($back);
@@ -680,18 +807,21 @@ function backup_admin(array $plugin): string
     }
     $html .= '</tbody></table>';
 
-    // 设置表单（计划 + 两个渠道放一张表单，一次保存）。
+    // 设置表单（计划 + 两个渠道 + 文件选项放一张表单，一次保存）。
+    // 各组配置按「启用勾选」展开 / 收起：未勾选时折叠（hidden），字段仍随表单提交（切换不丢数据），由 backup_js 即时联动。
     $html .= '<form method="post">' . form_token()
         . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="backup_action" value="save">'
         . '<div style="font-weight:600;margin-bottom:8px">定时备份</div>'
         . checkbox('启用定时备份', 'schedule_enabled', $cfg['schedule_enabled'], '由外部 cron 每分钟调用任务入口，按下列间隔执行')
+        . '<div data-backup-when="schedule_enabled"' . ($cfg['schedule_enabled'] ? '' : ' hidden') . '>'
         . '<div class="form-grid-2">'
         . select_input('备份间隔', 'schedule_interval', $cfg['schedule_interval'], ['hourly' => '每小时', '6h' => '每 6 小时', 'daily' => '每天', 'weekly' => '每周'])
-        . input('本地保留份数', 'keep_files', (string)$cfg['keep_files'], 'number', false, '1-50，超出自动删除最旧文件')
-        . '</div>'
+        . input('保留份数', 'keep_files', (string)$cfg['keep_files'], 'number', false, '1-50，超出自动删除最旧文件；启用 WebDAV 时每次上传后远端也按同份数同步清理（只清本插件生成的 backup- 文件）')
+        . '</div></div>'
 
         . '<div style="font-weight:600;margin:18px 0 8px">渠道一：邮箱</div>'
         . checkbox('启用邮箱备份', 'email_enabled', $cfg['email_enabled'], '通过 SMTP 发送邮件，备份文件作为附件')
+        . '<div data-backup-when="email_enabled"' . ($cfg['email_enabled'] ? '' : ' hidden') . '>'
         . '<div class="form-grid-2">'
         . input('SMTP 服务器', 'smtp_host', $cfg['smtp_host'], 'text', false, '如 smtp.qq.com / smtp.163.com')
         . input('端口', 'smtp_port', (string)$cfg['smtp_port'], 'number', false, 'SSL 常用 465，STARTTLS 常用 587')
@@ -704,15 +834,19 @@ function backup_admin(array $plugin): string
         . '<div class="form-grid-2">'
         . input('发件人', 'mail_from', $cfg['mail_from'], 'text', false, '留空使用 SMTP 账号')
         . input('收件人', 'mail_to', $cfg['mail_to'], 'text', false, '多个用逗号分隔')
-        . '</div>'
+        . '</div></div>'
 
         . '<div style="font-weight:600;margin:18px 0 8px">渠道二：WebDAV</div>'
-        . checkbox('启用 WebDAV 备份', 'webdav_enabled', $cfg['webdav_enabled'], '通过 HTTP PUT 上传到 WebDAV 目录（坚果云 / Nextcloud 等）')
+        . checkbox('启用 WebDAV 备份', 'webdav_enabled', $cfg['webdav_enabled'], '通过 HTTP PUT 上传到 WebDAV 目录（坚果云 / Nextcloud / Koofr 等）')
+        . '<div data-backup-when="webdav_enabled"' . ($cfg['webdav_enabled'] ? '' : ' hidden') . '>'
         . input('目录 URL', 'webdav_url', $cfg['webdav_url'], 'text', false, '如 https://dav.jianguoyun.com/dav/我的坚果云/mono-backup')
         . '<div class="form-grid-2">'
         . input('账号', 'webdav_user', $cfg['webdav_user'], 'text')
         . input('密码', 'webdav_pass', '', 'password', false, $cfg['webdav_pass'] !== '' ? '已保存，留空保持不变' : '')
-        . '</div>'
+        . '</div></div>'
+
+        . '<div style="font-weight:600;margin:18px 0 8px">备份文件</div>'
+        . checkbox('压缩备份文件（.gz）', 'compress', $cfg['compress'], 'gzip 压缩保存与推送（体积更小）；还原时自动解压，下载得到的为 .gz 文件需自行解压')
 
         . '<button class="btn" type="submit" style="margin-top:16px">保存设置</button></form>';
 
@@ -720,8 +854,8 @@ function backup_admin(array $plugin): string
     $html .= '<form method="post" enctype="multipart/form-data" style="margin-top:20px">' . form_token()
         . '<input type="hidden" name="admin_action" value="noop"><input type="hidden" name="backup_action" value="restore_upload">'
         . '<div style="font-weight:600;margin-bottom:8px">上传还原</div>'
-        . '<label class="grid">' . form_field_caption('选择备份文件', '支持 .sqlite / .db（SQLite 快照）或 .json（数据快照）；受服务器上传大小限制')
-        . '<input type="file" name="backup_file" accept=".sqlite,.db,.json"></label>'
+        . '<label class="grid">' . form_field_caption('选择备份文件', '支持 .sqlite / .db（SQLite 快照）、.json（数据快照）与 .gz 压缩文件；受服务器上传大小限制')
+        . '<input type="file" name="backup_file" accept=".sqlite,.db,.json,.gz"></label>'
         . '<div class="btn-row" style="margin-top:10px">'
         . '<button class="btn danger" type="submit" data-confirm="确定上传并还原吗？当前数据将被覆盖（还原前会自动留底）。">上传并还原</button>'
         . '</div></form>';
@@ -744,13 +878,38 @@ function backup_css(): string
 CSS;
 }
 
+// 后台配置页：定时备份 / 邮箱 / WebDAV 三组配置随各自「启用」勾选展开收起（未勾选的组仍随表单提交，切换不丢数据）。
+function backup_js(): string
+{
+    return <<<'JS'
+(function () {
+  'use strict';
+  var host = document.querySelector('[data-backup-when]');
+  var form = host && host.closest ? host.closest('form') : null;
+  if (!form) return;
+  var apply = function (name) {
+    var box = form.querySelector('input[type="checkbox"][name="' + name + '"]');
+    var block = form.querySelector('[data-backup-when="' + name + '"]');
+    if (!box || !block) return;
+    if (box.checked) block.removeAttribute('hidden');
+    else block.setAttribute('hidden', '');
+  };
+  ['schedule_enabled', 'email_enabled', 'webdav_enabled'].forEach(function (name) {
+    var box = form.querySelector('input[type="checkbox"][name="' + name + '"]');
+    if (box) box.addEventListener('change', function () { apply(name); });
+    apply(name);
+  });
+}());
+JS;
+}
+
 return [
     'id' => 'backup',
     'name' => '备份 / 还原',
-    'version' => '1.0.2',
-    'description' => '一键备份数据库（SQLite / MySQL / PostgreSQL）并支持下载 / 还原；可开启定时备份，备份文件可同时推送到邮箱或 WebDAV。',
+    'version' => '1.0.4',
+    'description' => '一键备份数据库（SQLite / MySQL / PostgreSQL）并支持下载 / 还原；可开启定时备份，备份文件支持 gzip 压缩，可同时推送到邮箱或 WebDAV（兼容 TeraCloud / Koofr 等）。',
     'author' => 'Mono',
-    'assets' => ['css' => 'backup_css'],
+    'assets' => ['css' => 'backup_css', 'js' => 'backup_js'],
     'routes' => ['backup_download' => 'backup_download_route'],
     'admin_tabs' => ['backup' => 'backup_admin'],
     'cron' => ['scheduled' => ['callback' => 'backup_cron_task', 'interval' => 'backup_interval_seconds']],

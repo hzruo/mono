@@ -6,9 +6,10 @@ if (!defined('APP_ROOT')) exit;
  *
  * 文章里把媒体链接「独立成行」（裸链接或 [文字](链接)）粘贴，渲染时自动变成嵌入播放器：
  * - 网易云音乐：歌曲（type=2）/ 专辑（type=1）/ 歌单（type=0）走官方 outchain 外链播放器；
+ *   网页与移动域名（music.163.com / y.music.163.com）直链直接识别，163cn.tv 分享短链服务端展开后嵌入；
  * - 视频网站：哔哩哔哩（player.bilibili.com）、YouTube（embed / 播放列表）、抖音（open.douyin.com）；
  * - 直链文件：mp3/m4a 等音频 → <audio>，mp4/webm 等视频 → <video>；
- * - 短链：v.douyin.com / b23.tv 服务端展开 302 跳转（结果缓存进 plugin_media_links），
+ * - 短链：v.douyin.com / b23.tv / 163cn.tv 服务端展开 302 跳转（结果缓存进 plugin_media_links），
  *   再嵌入对应播放器；解析失败或关闭解析时渲染为链接卡片（可配置）；
  * - 每个 iframe 播放器下方附「无法播放？前往…」原链接回落（指向平台规范地址）：
  *   访客网络无法直连该平台（如直连 YouTube）或视频失效时的逃生口；
@@ -143,8 +144,18 @@ function media_embed(string $url): ?string
             return media_video_file_html($url);
         }
         // 2) 网易云音乐：song / album / playlist（外链播放器 type 映射 2/1/0 已按官方播放器源码核实）。
-        if (preg_match('~^https?://(?:www\.)?music\.163\.com/(?:#/|m/)?(song|album|playlist)\?(?:[^#]*?&)?id=(\d+)~i', $url, $m)) {
+        // 兼容网页（music.163.com）与移动（y.music.163.com）域名，#/ 与 m/ 路径前缀均支持。
+        if (preg_match('~^https?://(?:www\.|y\.)?music\.163\.com/(?:#/|m/)?(song|album|playlist)\?(?:[^#]*?&)?id=(\d+)~i', $url, $m)) {
             return media_netease_html(strtolower($m[1]), (int)$m[2]);
+        }
+        // 网易云分享短链 163cn.tv/xxx：服务端展开 302 得到 y.music.163.com/m/<kind>?id=…，再嵌入播放器。
+        if (preg_match('~^https?://163cn\.tv/[A-Za-z0-9]+~i', $url)) {
+            if (!$cfg['resolve_short']) return $cfg['link_card'] ? media_card_html('网易云音乐', $url) : null;
+            $target = media_short_target($url, 'netease');
+            if ($target !== '' && preg_match('~^(song|album|playlist)/(\d+)$~', $target, $nm)) {
+                return media_netease_html($nm[1], (int)$nm[2]);
+            }
+            return $cfg['link_card'] ? media_card_html('网易云音乐', $url) : null;
         }
         // 3) YouTube：watch / youtu.be / shorts / live / embed / 播放列表。
         if (preg_match('~^https?://(?:www\.|m\.|music\.)?youtube\.com/(?:watch\?(?:[^#]*?&)?v=|shorts/|live/|embed/)([A-Za-z0-9_-]{6,})~i', $url, $m)) {
@@ -338,7 +349,7 @@ function media_file_name(string $url): string
 
 // --- 短链展开（服务端 302 解析 + 缓存）---
 
-// 解析短链并返回目标 ID（抖音视频 ID / B 站 BV 号）；失败返回 ''。
+// 解析短链并返回目标 ID（抖音视频 ID / B 站 BV 号 / 网易云 kind/id 组合）；失败返回 ''。
 // 结果缓存进 plugin_media_links：成功 7 天，失败 1 小时（避免反复空转请求）。
 function media_short_target(string $url, string $kind): string
 {
@@ -358,6 +369,7 @@ function media_short_target(string $url, string $kind): string
     if ($location !== '') {
         if ($kind === 'douyin' && preg_match('~/(?:share/video|shared/video|video|share/note|note)/(\d{10,})~', $location, $m)) $target = $m[1];
         if ($kind === 'bili' && preg_match('~bilibili\.com/video/(BV[0-9A-Za-z]+|av\d+)~i', $location, $m)) $target = $m[1];
+        if ($kind === 'netease' && preg_match('~music\.163\.com/(?:#/|m/)?(song|album|playlist)\?(?:[^#]*?&)?id=(\d+)~i', $location, $m)) $target = strtolower($m[1]) . '/' . $m[2];
     }
     try {
         app_db_upsert('plugin_media_links', ['url_key' => $key, 'target' => $target, 'updated_at' => now()], ['url_key']);
@@ -529,7 +541,7 @@ function media_js(): string
   // 排除空白/引号/尖括号/标点与汉字（粘贴文本里 URL 通常以空格或中文接续，
   // URL 中出现原样中文必然是被夹带的说明文字）。
   var URL_RE = /https?:\/\/[^\s"'<>\u4e00-\u9fff\u3000-\u303f\uff00-\uffef【】（）]+/g;
-  var HOST_RE = /(?:^|\.)(?:music\.163\.com|bilibili\.com|b23\.tv|douyin\.com|iesdouyin\.com|youtube\.com|youtu\.be)$/i;
+  var HOST_RE = /(?:^|\.)(?:music\.163\.com|163cn\.tv|bilibili\.com|b23\.tv|douyin\.com|iesdouyin\.com|youtube\.com|youtu\.be)$/i;
   var FILE_RE = /\.(?:mp3|m4a|aac|ogg|oga|opus|wav|flac|weba|mp4|m4v|webm|ogv|mov)(?:[?#]|$)/i;
 
   function pickUrls(text) {
@@ -539,7 +551,8 @@ function media_js(): string
     for (var i = 0; i < m.length; i++) {
       var t = m[i].replace(/[\u200b-\u200d\ufeff]/g, '');
       var u;
-      do { u = t; t = u.replace(/[)\]}>.,;!?"']+$/, ''); } while (t !== u && t.length > 8);
+      // 去掉结尾标点与包裹符号（分享文案尾巴如 `(来自@网易云音乐)`）。
+      do { u = t; t = u.replace(/[()\]}>.,;!?"']+$/, ''); } while (t !== u && t.length > 8);
       try { if (!HOST_RE.test(new URL(t).hostname) && !FILE_RE.test(t)) continue; } catch (err) { continue; }
       if (seen[t]) continue;
       seen[t] = 1;
@@ -571,7 +584,7 @@ function media_js(): string
     mask.className = 'media-dlg-mask';
     mask.innerHTML = '<div class="media-dlg" role="dialog" aria-label="插入媒体">'
       + '<h3 class="media-dlg-title">插入媒体</h3>'
-      + '<p class="media-dlg-hint">把分享内容整段粘贴到这里（网易云 / 哔哩哔哩 / 抖音 / YouTube 的分享文案或链接，支持多个），自动解析出链接并按「独立成行」插入。</p>'
+      + '<p class="media-dlg-hint">把分享内容整段粘贴到这里（网易云 / 哔哩哔哩 / 抖音 / YouTube 的分享文案或链接，也支持 mp3 / mp4 等音视频直链，可多个），自动解析出链接并按「独立成行」插入。</p>'
       + '<textarea rows="5" placeholder="例如：6.48 复制打开抖音，看看【某某的作品】… https://v.douyin.com/xxxx/"></textarea>'
       + '<p class="media-dlg-found"></p>'
       + '<div class="media-dlg-actions"><button type="button" class="btn ghost" data-x="cancel">取消</button>'
@@ -630,6 +643,9 @@ function media_js(): string
     var spacer = bar.querySelector('.md-spacer');
     bar.insertBefore(btn, spacer || null);
   })();
+
+  // 供其它插件复用（如动态发布框的「插入媒体」按钮）：暴露分享文案解析对话框。
+  window.MonoMedia = { pickUrls: pickUrls, openDialog: openDialog };
 })();
 JS;
 }
@@ -658,7 +674,7 @@ function media_admin(array $plugin): string
     $note = '<div class="note">写作页工具栏有「媒体」按钮：把分享文案整段粘贴即可自动解析出链接（无需手动提取）。'
         . '手动插入的规则：链接需<strong>独立成行</strong>（<code>https://…</code> 或 <code>[文字](链接)</code>，'
         . '链接文字会被播放器取代；一行多个链接会被整体识别；列表项 / 引用块里的独立链接行同样生效）；混在句子里的链接保持普通链接。示例：<br>'
-        . '<code>https://music.163.com/#/song?id=38019459</code>（网易云歌曲 / 专辑 / 歌单）<br>'
+        . '<code>https://music.163.com/#/song?id=38019459</code>（网易云歌曲 / 专辑 / 歌单，含 163cn.tv 分享短链与移动端 y.music.163.com 域名）<br>'
         . '<code>https://www.bilibili.com/video/BV1SUhe6xEM2/</code>（哔哩哔哩，含 b23.tv 短链）<br>'
         . '<code>https://v.douyin.com/7ziPVgRU3S4/</code>（抖音，含短链）<br>'
         . '<code>https://youtube.com/shorts/I0bJ983oMWE</code>（YouTube：视频 / Shorts / 播放列表）<br>'
@@ -679,8 +695,8 @@ function media_admin(array $plugin): string
 return [
     'id' => 'media',
     'name' => '媒体嵌入',
-    'version' => '1.1.1',
-    'description' => '把独立成行的媒体链接自动变成播放器：网易云音乐、哔哩哔哩、YouTube、抖音与音视频直链；写作页「媒体」按钮支持粘贴分享文案自动解析。',
+    'version' => '1.2.0',
+    'description' => '把独立成行的媒体链接自动变成播放器：网易云音乐（含 163cn.tv 分享短链）、哔哩哔哩、YouTube、抖音与音视频直链；写作页「媒体」按钮支持粘贴分享文案自动解析。',
     'author' => 'Mono',
     'assets' => ['css' => 'media_css', 'js' => 'media_js'],
     'hooks' => [

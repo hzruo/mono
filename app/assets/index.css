@@ -322,7 +322,7 @@ textarea { resize: vertical; min-height: 130px; line-height: 1.7; }
 /* --- 确认弹窗：data-confirm 的站内样式二次确认（替代浏览器原生 confirm） --- */
 .confirm-mask { position: fixed; inset: 0; z-index: 130; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, .45); animation: confirm-fade .16s ease; }
 .confirm-box { width: 100%; max-width: 400px; padding: 20px; background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-md); animation: confirm-in .18s ease; }
-.confirm-msg { margin: 0; font-size: var(--font-size-md); line-height: 1.6; }
+.confirm-msg { margin: 0; font-size: var(--font-size-md); line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
 .confirm-option { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; padding: 9px 12px; background: var(--danger-soft); border: 1px solid color-mix(in oklab, var(--destructive) 26%, transparent); border-radius: calc(var(--radius) - 4px); color: var(--destructive); font-size: var(--font-size-sm); line-height: 1.5; cursor: pointer; }
 .confirm-option input { width: auto; margin: 2px 0 0; flex: none; accent-color: var(--destructive); }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }

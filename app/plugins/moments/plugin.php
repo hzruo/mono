@@ -13,6 +13,9 @@ if (!defined('APP_ROOT')) exit;
  * - 待审自见：先审后显模式下，游客自己提交的待审评论仅本机可见（签名 cookie 记录，标「审核中」）；通过 / 拒绝后自动移出并清理记录。
  * - 图片：图床插件（imgbed）启用且配置完成时直传图床（同步进图床管理列表，动态内存完整 URL）；
  *   否则回退本地 DATA_DIR/plugins/moments/（服务端命名 moment-<12hex>.<ext>，仅经输出路由访问）。
+ * - 多媒体：正文中「独立成行」的媒体链接（网易云 / 哔哩哔哩 / YouTube / 抖音，含 163cn.tv 等短链）
+ *   在「媒体嵌入」（media）插件启用时自动嵌入播放器；发布框出现「插入媒体」按钮（复用 media
+ *   的分享文案解析对话框，把链接按独立成行插入）。未启用 media 时按钮不出现、链接保持纯文本。
  * - 后台：顶部常驻「动态」标签为评论分页审核列表（通过 / 删除）；「插件 → 动态」配置页只保留设置
  *   （发布权限 + 评论开关）。
  *
@@ -221,7 +224,11 @@ function moments_upload_route(array $plugin): void
 
         // 本地存储（未启用图床或图床未配置完成）。
         if (!is_array($f) || (int)($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) json_response(['ok' => 0, 'message' => '未收到上传文件']);
-        if ((int)$f['error'] !== UPLOAD_ERR_OK) json_response(['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）']);
+        if ((int)$f['error'] !== UPLOAD_ERR_OK) {
+            // 1 = UPLOAD_ERR_INI_SIZE：超过 php.ini 限制，与图床插件同款明确提示。
+            if ((int)$f['error'] === UPLOAD_ERR_INI_SIZE) json_response(['ok' => 0, 'message' => '图片超过服务器上传上限（PHP upload_max_filesize = ' . ini_get('upload_max_filesize') . '）：请调大 php.ini 的 upload_max_filesize / post_max_size 后重启 PHP，或先压缩图片再上传']);
+            json_response(['ok' => 0, 'message' => '上传失败（错误码 ' . (int)$f['error'] . '）']);
+        }
         if ((int)($f['size'] ?? 0) > 5 * 1024 * 1024) json_response(['ok' => 0, 'message' => '图片不能超过 5MB']);
         $tmp = (string)($f['tmp_name'] ?? '');
         if ($tmp === '' || !is_uploaded_file($tmp)) json_response(['ok' => 0, 'message' => '非法的上传文件']);
@@ -451,6 +458,17 @@ function moments_page_route(array $plugin): void
     }
 }
 
+// 图标（Lucide 风格，与核心顶栏 / 评论工具栏同一规格：24 视窗 + stroke-width 2 + currentColor）。
+function moments_icon(string $name): string
+{
+    $paths = [
+        'image' => '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+        'play' => '<circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/>',
+    ];
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        . ($paths[$name] ?? '') . '</svg>';
+}
+
 // 顶部快捷发布框：未登录且要求登录时显示提示；游客可发布时显示昵称输入。
 function moments_publish_box(): string
 {
@@ -467,8 +485,8 @@ function moments_publish_box(): string
         . '<input type="hidden" name="images" value="">'
         . '<div class="moments-previews" data-moments-previews hidden></div>'
         . '<div class="moments-publish-bar">'
-        . '<button type="button" class="btn ghost sm" data-moments-pick>添加图片</button>'
-        . '<span class="moments-pick-hint">最多 9 张，单张 ≤5MB</span>'
+        . '<button type="button" class="moments-tool-btn" data-moments-pick title="添加图片（最多 9 张，单张 ≤5MB）" aria-label="添加图片">' . moments_icon('image') . '</button>'
+        . (isset(plugins()['media']) ? '<button type="button" class="moments-tool-btn" data-moments-media title="插入媒体：粘贴分享文案或链接，自动解析（网易云 / 哔哩哔哩 / 抖音 / YouTube，含短链与音视频直链）" aria-label="插入媒体">' . moments_icon('play') . '</button>' : '')
         . '<button class="btn" type="submit">发布</button>'
         . '</div>'
         . '<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden data-moments-file'
@@ -583,7 +601,7 @@ function moments_card(array $r, array $ctx): string
     $html .= '</div>';
 
     $content = trim((string)$r['content']);
-    if ($content !== '') $html .= '<div class="moments-body">' . nl2br(h($content)) . '</div>';
+    if ($content !== '') $html .= '<div class="moments-body">' . moments_content_html($content) . '</div>';
     $html .= moments_image_grid((array)plugin_json_decode((string)$r['images'], []));
 
     if ($ctx['like_on'] || $ctx['comment_on']) {
@@ -604,6 +622,44 @@ function moments_card(array $r, array $ctx): string
     }
     if ($ctx['comment_on']) $html .= moments_comment_block($id, $ctx['comments'][$id] ?? [], $ctx['comment_cfg']);
     return $html . '</article>';
+}
+
+// 正文渲染：默认 h() 转义 + nl2br；「媒体嵌入」（media）插件启用时，独立成行的媒体链接行
+// 替换为嵌入播放器（占位符回填方案：\x00 包裹的占位符不会被 h() 转义与 nl2br 破坏，
+// 最后连同相邻 <br> 整段回填——与 media 插件 markdown.after 同思路；整行必须只含一个链接才嵌入）。
+function moments_content_html(string $content): string
+{
+    $embeds = [];
+    $token = '';
+    try {
+        if (str_contains($content, '://')) {
+            $media = plugins()['media'] ?? null;
+            if (is_array($media)) {
+                plugin_load($media);
+                if (function_exists('media_embed')) {
+                    $token = bin2hex(random_bytes(5));
+                    $content = preg_replace_callback('/^[\t ]*(\S+)[\t ]*\r?$/m', static function (array $m) use (&$embeds, $token): string {
+                        if (!preg_match('~^https?://~i', $m[1])) return $m[0];
+                        $html = media_embed($m[1]);
+                        if ($html === null) return $m[0];
+                        $embeds[] = $html;
+                        return "\x00MOMENT" . $token . "-" . (count($embeds) - 1) . "\x01";
+                    }, $content) ?? $content;
+                }
+            }
+        }
+    } catch (\Throwable $e) {
+        error_log('[Mono moments] content: ' . $e->getMessage());
+    }
+    $html = nl2br(h($content));
+    if ($token === '' || !$embeds) return $html;
+    try {
+        $pattern = '/(?:<br\s*\/?>\s*)*\x00MOMENT' . preg_quote($token, '/') . '-(\d+)\x01(?:\s*<br\s*\/?>)*/';
+        $html = preg_replace_callback($pattern, static fn(array $m): string => $embeds[(int)$m[1]] ?? '', $html) ?? $html;
+    } catch (\Throwable $e) {
+        error_log('[Mono moments] content: ' . $e->getMessage());
+    }
+    return $html;
 }
 
 // 九宫格图片（点击走灯箱，href 兜底可直接打开）；兼容本地文件与图床 URL。
@@ -879,7 +935,10 @@ function moments_css(): string
 .moments-publish textarea:focus{border-color:var(--ring);box-shadow:0 0 0 3px color-mix(in oklab,var(--ring) 22%,transparent)}
 .moments-name-input{display:block;width:100%;max-width:260px;margin-bottom:8px;padding:8px 12px;border:1px solid var(--input);border-radius:8px;background:var(--background);color:var(--foreground);outline:none}
 .moments-publish-bar{display:flex;align-items:center;gap:10px;margin-top:10px}
-.moments-pick-hint{margin-right:auto;color:var(--text-subtle);font-size:var(--font-size-xs)}
+.moments-publish-bar .btn{margin-left:auto}
+.moments-tool-btn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text-muted);cursor:pointer}
+.moments-tool-btn:hover{border-color:var(--brand);color:var(--brand)}
+.moments-tool-btn svg{display:block;width:16px;height:16px}
 .moments-previews{display:grid;grid-template-columns:repeat(auto-fill,86px);gap:8px;margin-top:10px}
 .moments-preview{position:relative;width:86px;height:86px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--muted)}
 .moments-preview img{display:block;width:100%;height:100%;object-fit:cover}
@@ -961,6 +1020,12 @@ function moments_js(): string
 (function () {
   'use strict';
 
+  // 站内提示：优先核心的 MonoAlert（与全站确认弹窗同款视觉），核心脚本未就绪时回退原生 alert。
+  function notice(msg) {
+    if (typeof window.MonoAlert === 'function') window.MonoAlert(msg);
+    else alert(msg);
+  }
+
   // 发布框：选图 → AJAX 上传 → 九宫格预览（可移除）→ 同步 hidden images 字段。
   function bindPublisher() {
     var form = document.querySelector('[data-moments-publish]');
@@ -976,15 +1041,15 @@ function moments_js(): string
       if (!names.length) previews.hidden = true;
     };
     pick.addEventListener('click', function () {
-      if (names.length >= 9) { alert('最多上传 9 张图片'); return; }
+      if (names.length >= 9) { notice('最多上传 9 张图片'); return; }
       file.click();
     });
     file.addEventListener('change', function () {
       var list = Array.prototype.slice.call(file.files || []);
       file.value = '';
       list.forEach(function (f) {
-        if (names.length >= 9) { alert('最多上传 9 张图片'); return; }
-        if (f.size > 5 * 1024 * 1024) { alert('图片不能超过 5MB：' + f.name); return; }
+        if (names.length >= 9) { notice('最多上传 9 张图片'); return; }
+        if (f.size > 5 * 1024 * 1024) { notice('图片不能超过 5MB：' + f.name); return; }
         uploadOne(f);
       });
     });
@@ -1005,7 +1070,7 @@ function moments_js(): string
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
         body: fd
       }).then(function (r) { return r.json(); }).then(function (res) {
-        if (!res || res.ok !== 1) { item.remove(); alert((res && res.message) || '上传失败，请重试'); return; }
+        if (!res || res.ok !== 1) { item.remove(); notice((res && res.message) || '上传失败，请重试'); return; }
         var img = document.createElement('img');
         img.src = res.url;
         img.alt = '';
@@ -1023,8 +1088,22 @@ function moments_js(): string
         item.appendChild(del);
         names.push(res.file);
         sync();
-      }).catch(function () { item.remove(); alert('网络错误，上传失败，请重试'); });
+      }).catch(function () { item.remove(); notice('网络错误，上传失败，请重试'); });
     }
+  }
+
+  // 「插入媒体」按钮（media 插件启用时才渲染）：复用其分享文案解析对话框，把链接按独立成行插入正文。
+  function bindMediaButton() {
+    var btn = document.querySelector('[data-moments-media]');
+    if (!btn) return;
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      var form = btn.closest('[data-moments-publish]');
+      var ta = form ? form.querySelector('textarea[name="content"]') : null;
+      if (!ta) return;
+      if (window.MonoMedia && window.MonoMedia.openDialog) window.MonoMedia.openDialog(ta);
+      else notice('媒体插件未就绪，请刷新页面后重试');
+    });
   }
 
   // 点赞：拦截提交走 AJAX，原地更新状态与计数。
@@ -1042,11 +1121,11 @@ function moments_js(): string
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
         body: new FormData(form)
       }).then(function (r) { return r.json(); }).then(function (res) {
-        if (!res || res.ok !== 1) { alert((res && res.message) || '操作失败，请重试'); return; }
+        if (!res || res.ok !== 1) { notice((res && res.message) || '操作失败，请重试'); return; }
         if (res.liked) btn.classList.add('liked'); else btn.classList.remove('liked');
         btn.title = res.liked ? '取消点赞' : '点赞';
         if (count) count.textContent = res.count > 0 ? String(res.count) : '赞';
-      }).catch(function () { alert('网络错误，操作失败，请重试'); }).then(function () { btn.disabled = false; });
+      }).catch(function () { notice('网络错误，操作失败，请重试'); }).then(function () { btn.disabled = false; });
     });
   }
 
@@ -1161,7 +1240,7 @@ function moments_js(): string
     });
   }
 
-  function init() { bindPublisher(); bindLikes(); bindCommentReplies(); bindGuestFields(); bindLightbox(); }
+  function init() { bindPublisher(); bindMediaButton(); bindLikes(); bindCommentReplies(); bindGuestFields(); bindLightbox(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 }());
@@ -1171,8 +1250,8 @@ JS;
 return [
     'id' => 'moments',
     'name' => '动态',
-    'version' => '1.3.0',
-    'description' => '微博式动态流：顶部快捷发布（文字 + 最多 9 张图片，启用图床后图片直传图床）；点赞与评论复用已启用的「文章点赞」「评论」插件，动态评论可单独开关并跟随其楼中楼模式，游客昵称 / 邮箱填过一次即自动预填，待审评论仅提交者本人可见（标「审核中」，通过 / 拒绝后自动隐藏）；支持发布权限控制、后台「动态」标签分页审核与 AI 自动审核。',
+    'version' => '1.4.2',
+    'description' => '微博式动态流：顶部快捷发布（文字 + 最多 9 张图片，启用图床后图片直传图床；正文中独立成行的媒体链接在启用「媒体嵌入」插件时自动嵌入播放器，发布框提供图片 / 媒体图标按钮）；点赞与评论复用已启用的「文章点赞」「评论」插件，动态评论可单独开关并跟随其楼中楼模式，游客昵称 / 邮箱填过一次即自动预填，待审评论仅提交者本人可见（标「审核中」，通过 / 拒绝后自动隐藏）；支持发布权限控制、后台「动态」标签分页审核与 AI 自动审核。',
     'author' => 'Mono',
     'assets' => ['css' => 'moments_css', 'js' => 'moments_js'],
     'hooks' => [
