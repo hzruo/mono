@@ -60,11 +60,11 @@ done
 
 # 5. 汇总
 FILES="$(printf '%s\n' "$LIST" | grep -vc '/$' || true)"
-SIZE="$(du -h "$OUT" | cut -f1 | tr -d ' ')"
+SIZE="$(wc -c < "$OUT" | tr -d ' ')"
 echo "--------------------------------------------------"
 echo "部署包生成成功"
 echo "  产物：${OUT}"
 echo "  版本：v${VERSION}（提交 $(git rev-parse --short HEAD)）"
-echo "  文件：${FILES} 个，约 ${SIZE}"
+echo "  文件：${FILES} 个，${SIZE} 字节"
 echo "  排除：app/data、.env、plugins.css|js、.git、scripts/、系统文件"
 echo "  部署：解压到网站根目录 → 访问域名自动安装"
