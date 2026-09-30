@@ -156,7 +156,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans G
 h1,h2,h3,h4{letter-spacing:-.012em}
 .brand,.post-title,.content h1,.content h2,.content h3,.content h4{font-family:var(--paper-display);color:var(--paper-ink)}
 
-/* 2. 单栏居中：前台单列化，版心沿用核心 1100px——与后台/写文章页、顶栏、页脚完全同宽 */
+/* 2. 单栏居中：前台单列化，版心沿用核心 --content-max（窄屏 1100px、宽屏自适应放宽）——与后台/写文章页、顶栏、页脚完全同宽 */
 .wrap{grid-template-columns:1fr}
 
 /* 3. 侧栏下移：变为内容区下方的站点导航区（去卡片化，分类/标签/归档仍可达） */
