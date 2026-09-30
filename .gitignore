@@ -11,6 +11,9 @@
 /app/assets/plugins.css
 /app/assets/plugins.js
 
+# 部署包输出目录：由 git archive 生成的部署压缩包，不入库
+/dist/
+
 # 本地环境配置（可能含数据库口令），示例见 .env.example
 .env
 
