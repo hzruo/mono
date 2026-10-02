@@ -945,10 +945,14 @@ function code_highlight(string $code, string $lang): string
 
 function markdown_html(string $text): string
 {
+    // 换行归一化：浏览器提交的 textarea（写文章页保存 / 分栏预览）换行会被规范化为 CRLF，
+    // 统一为 LF 后再解析，避免 \r 躲过行尾锚点（标题 / 列表 / 围栏等）导致整块不渲染。
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
     $text = (string)hook('markdown.render', $text, []);
     // 提取代码块：服务端高亮 + 语言标签/复制按钮外壳，避免内部被其它规则破坏。
+    // 语言标签容忍 +/#/. 等字符（c++、c#、objective-c）与尾随空白；闭合围栏须独立成行（允许缩进与尾随空白）。
     $blocks = [];
-    $text = preg_replace_callback('/```(\w*)\n(.*?)```/s', function ($m) use (&$blocks) {
+    $text = preg_replace_callback('/```[ \t]*([A-Za-z0-9_+#.-]*)[ \t]*\n(.*?)^[ \t]*```[ \t]*$/ms', function ($m) use (&$blocks) {
         $lang = strtolower($m[1]);
         $raw = rtrim($m[2], "\n");
         $label = $lang !== '' ? $lang : 'text';
@@ -988,8 +992,8 @@ function markdown_html(string $text): string
     // 段落与换行
     $text = nl2br($text);
     $text = preg_replace('/<br\s*\/?>\s*(<\/?(?:h[1-6]|ul|li|blockquote|pre|hr|img)[^>]*>)/', '$1', $text) ?? $text;
-    // 还原代码块
-    $text = preg_replace_callback('/\x00BLOCK(\d+)\x00/', fn($m) => $blocks[(int)$m[1]] ?? '', $text) ?? $text;
+    // 还原代码块：连同相邻 <br> 一起回填，避免块级外壳前后多出空行（与 media 插件同思路）。
+    $text = preg_replace_callback('/(?:<br\s*\/?>\s*)*\x00BLOCK(\d+)\x00(?:\s*<br\s*\/?>)*/', fn($m) => $blocks[(int)$m[1]] ?? '', $text) ?? $text;
 
     return (string)hook('markdown.after', $text, []);
 }
@@ -1493,7 +1497,9 @@ function save_post(array $data, int $post_id = 0): int
     $row = [
         'user_id' => (int)($data['user_id'] ?? uid()),
         'title' => mb_substr((string)$data['title'], 0, DB_STRING_MAX_LENGTH),
-        'content' => (string)$data['content'],
+        // 浏览器提交的 textarea 换行会被规范化为 CRLF，入库前统一为 LF；
+        // 渲染侧 markdown_html 亦有同样的归一化，兜底历史数据与外部写入。
+        'content' => str_replace(["\r\n", "\r"], "\n", (string)$data['content']),
         'category_id' => (int)($data['category_id'] ?? 0),
         'status' => (int)($data['status'] ?? 1) === 1 ? 1 : 0,
         'updated_at' => now(),

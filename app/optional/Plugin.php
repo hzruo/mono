@@ -213,6 +213,23 @@ final class Plugin
         return array_values(array_unique($functions));
     }
 
+    /**
+     * 判断函数是否由插件目录内的文件定义（而非核心/内置）。
+     * 用于冲突检测：后台「同步插件」发生在 app.boot 加载本插件之后时，插件自己的函数
+     * 也已存在，不能据此判为「与核心冲突」。
+     */
+    private static function plugin_fn_defined_in_plugins(string $fn): bool
+    {
+        try {
+            $src = (new \ReflectionFunction($fn))->getFileName();
+        } catch (\Throwable) {
+            return false;
+        }
+        if (!is_string($src) || $src === '') return false;
+        $dir = rtrim(str_replace('\\', '/', PLUGIN_DIR), '/') . '/';
+        return str_starts_with(str_replace('\\', '/', $src), $dir);
+    }
+
     public static function plugin_function_conflicts(array $files): array
     {
         $seen = [];      // fn => file
@@ -220,9 +237,14 @@ final class Plugin
         foreach ($files as $file) {
             foreach (self::plugin_file_functions($file) as $fn) {
                 if (function_exists($fn) && !isset($seen[$fn])) {
-                    // 与核心函数冲突（核心函数在 index.php 已定义）。
-                    $conflicts[$file][] = "函数 $fn 与核心或其它插件冲突";
-                    continue;
+                    // function_exists 只能证明函数已定义，不能证明它由核心定义：同步可能运行在
+                    // 插件已加载之后（如后台「同步插件」在 app.boot 之后触发），此时插件自身的
+                    // 函数也在函数表中，直接判核心冲突会把整个插件误禁用。用反射确认定义来源，
+                    // 由插件文件定义的跳过此判定（跨插件重名仍由下方 $seen 分支捕捉）。
+                    if (!self::plugin_fn_defined_in_plugins($fn)) {
+                        $conflicts[$file][] = "函数 $fn 与核心或其它插件冲突";
+                        continue;
+                    }
                 }
                 if (isset($seen[$fn])) {
                     $conflicts[$file][] = "函数 $fn 与 " . basename(dirname($seen[$fn])) . " 冲突";

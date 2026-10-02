@@ -11,10 +11,16 @@ if (!defined('APP_ROOT')) exit;
  *   支持续写 / 润色 / 排版 / 生成标签 / 自定义指令。
  * - admin_tabs ai：配置 provider、Base URL、API Key、模型（自动拉取 /models 列表供选择、
  *   可测试连通性），以及评论自动审核开关。
- * - cron review：按定时任务频率巡检待审核评论（任务最小间隔 60 秒；评论插件开启「先审后显」时），
- *   覆盖文章评论与动态评论（动态插件启用且评论开关开启，合计每轮上限），AI 判断
- *   通过 → status=1 公开展示；拒绝 → status=-1（保持不可见，后台仍可人工通过）。
- *   审核结论记录在 plugin_ai_reviews（动态评论以 1e9 偏移的 id 区分），供后台追溯。
+ * - 评论自动审核：巡检待审评论（评论插件开启「先审后显」时），覆盖文章评论与动态评论
+ *   （动态插件启用且评论开关开启，合计每轮上限），AI 判断通过 → status=1 公开展示；
+ *   拒绝 → status=-1（保持不可见，后台仍可人工通过）；审核结论记录在 plugin_ai_reviews
+ *   （动态评论以 1e9 偏移的 id 区分），供后台追溯。
+ * - 触发方式为「站点流量驱动」，无需外部定时任务：app.boot 时若距上轮已满 60 秒，就在
+ *   当前请求尾端（register_shutdown_function，响应先返回访客）内联执行一轮——查到期 →
+ *   抢锁 → 跑一小步 → （占位时间戳即下次到期时间）。不用站点对自身的回环 HTTP 请求
+ *   （WP 式回环会被登录 / WAF 等以 403 拦掉），也没有「无流量时每分钟固定请求一次」的
+ *   常驻开销。manifest 的 cron 定义保留：已配置外部 cron 的站点可继续用 CLI / HTTP
+ *   入口驱动，两条通道共用同一 60 秒节流状态，不会重复执行。
  *
  * 安全：所有 HTTP 调用仅在服务端进行（API Key 不出浏览器）；路由全部 need_admin + CSRF；
  * 回调内自行 try/catch，避免异常导致插件被核心自动停用。
@@ -275,7 +281,7 @@ function ai_modal_html(array $cfg): string
         . '</div></div></div></div>';
 }
 
-// --- 评论自动审核（cron 每分钟巡检）---
+// --- 评论自动审核（流量驱动 + 可选外部 cron）---
 function ai_review_context(array $cfg): array
 {
     if (!$cfg['review_enabled']) return [false, '自动审核未启用'];
@@ -441,7 +447,59 @@ function ai_review_pending(int $limit): array
     return $stats;
 }
 
-// cron 回调：任何异常只记录日志，绝不抛出（否则核心会停用整个插件）。
+// --- 流量驱动的内联调度 ---
+// 审核任务的最小间隔（秒）：与 manifest cron 的 interval 同一来源，调整只需改一处。
+function ai_review_interval(): int
+{
+    return (int)(plugins()['ai']['cron']['review']['interval'] ?? 60);
+}
+
+// app.boot（每次请求分发前触发）：仅在「审核已启用 + AI 就绪 + 距上轮已满间隔」时注册请求尾端回调。
+// 热路径只读内存缓存的配置与设置，绝大多数请求在这里零成本跳过，不产生任何 I/O。
+function ai_review_boot(mixed $value, array $ctx): void
+{
+    try {
+        $cfg = ai_config();
+        if (!$cfg['review_enabled'] || !ai_ready($cfg)) return;
+        if ((string)($_GET['a'] ?? '') === 'cron') return;   // 计划任务入口自身不再叠加触发
+        $last = (int)setting('cron_last_ai_review', '0');
+        if ($last > 0 && now() - $last < ai_review_interval()) return;
+        register_shutdown_function('ai_review_tick');
+    } catch (\Throwable $e) {
+        error_log('[Mono ai] review boot: ' . $e->getMessage());
+    }
+}
+
+// 请求尾端执行（register_shutdown_function 回调）：先把响应交给访客，再跑一小步审核。
+// 抢锁采用与核心 cron_run_due_tasks 相同的「先写时间戳占位」简单互斥，状态键同名
+// （cron_last_<插件id>_<任务名>）：流量触发与外部 cron 共享同一个 60 秒窗口，
+// 并发请求只有一个能进入，占位时间戳即下次到期时间的基准。
+function ai_review_tick(): void
+{
+    // 响应先出站：PHP-FPM 下 fastcgi_finish_request 立即结束请求并断开连接，
+    // 审核耗时（单个 AI 调用最长 60 秒）不占用访客等待；其它 SAPI 冲刷输出缓冲兜底。
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        ignore_user_abort(true);
+        while (ob_get_level() > 0 && @ob_end_flush());
+        @flush();
+    }
+    try {
+        $cfg = ai_config();
+        if (!$cfg['review_enabled'] || !ai_ready($cfg)) return;
+        // 二次到期检查：boot 判定到期后，本请求处理期间可能已有其它请求抢先跑过一轮。
+        $last = (int)setting('cron_last_ai_review', '0');
+        if ($last > 0 && now() - $last < ai_review_interval()) return;
+        save_settings_values(['cron_last_ai_review' => (string)now()]);   // 抢锁占位
+        ai_review_pending($cfg['review_limit']);   // 跑一小步（条数 = 后台「每轮最多处理」）
+    } catch (\Throwable $e) {
+        error_log('[Mono ai] review tick: ' . $e->getMessage());
+    }
+}
+
+// cron 回调（外部 cron / CLI 驱动，核心已按 interval 节流并写同一状态键，与流量触发互为补充）。
+// 任何异常只记录日志，绝不抛出（否则核心会停用整个插件）。
 function ai_cron_review(array $plugin, array $task): void
 {
     try {
@@ -531,6 +589,7 @@ function ai_admin(array $plugin): string
                 'review_prompt' => trim((string)($_POST['review_prompt'] ?? '')),
             ])));
             $stats = ai_review_pending(ai_config()['review_limit']);
+            save_settings_values(['cron_last_ai_review' => (string)now()]);   // 记录本轮：60 秒内流量触发不再重复
             if ($stats['message'] !== '') {
                 set_flash('设置已保存；未执行：' . $stats['message'], 'error');
             } else {
@@ -602,23 +661,22 @@ function ai_admin(array $plugin): string
         . ($ctx_notes ? ' <span style="color:var(--warning)">当前状态：' . h(implode('；', $ctx_notes)) . '，对应来源的自动审核暂不会触发。</span>' : '')
         . '</p>'
         . checkbox('启用评论自动审核', 'review_enabled', $cfg['review_enabled'])
-        . input('每轮最多处理', 'review_limit', (string)$cfg['review_limit'], 'number', false, '每轮文章 + 动态合计最多处理的条数（1-20）；执行频率由定时任务决定，任务最短 60 秒一轮')
+        . input('每轮最多处理', 'review_limit', (string)$cfg['review_limit'], 'number', false, '每轮文章 + 动态合计最多处理的条数（1-20）；由站点访问自动触发（评论提交后即触发），每轮最短间隔 60 秒')
         . textarea('自定义审核提示词', 'review_prompt', $cfg['review_prompt'], false, '留空使用内置默认提示词。只需描述审核标准与尺度，JSON 输出格式由系统自动附加，无需在此约定', 'rows="3"')
         . '<div class="btn-row">'
         . '<button class="btn" type="submit" name="ai_action" value="save_review">保存审核设置</button>'
         . '<button class="btn ghost" type="submit" name="ai_action" value="review_now">立即审核待审评论</button>'
         . '</div>'
-        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「立即审核待审评论」会先保存当前设置，再立即执行一轮（文章 + 动态合计处理条数同上），适合没有配置定时任务的站点。</p>'
+        . '<p style="color:var(--text-muted);font-size:var(--font-size-sm);margin:10px 0 0">「立即审核待审评论」会先保存当前设置，再立即执行一轮（文章 + 动态合计处理条数同上），也可用于随时手动补跑积压的待审评论。</p>'
         . '</form>';
 
-    // 自动化说明：解释定时任务入口的含义、执行频率机制与两种配置方式（HTTP 地址含访问令牌）。
+    // 自动化说明：主通道为「站点流量驱动」（零配置、不阻塞访客）；外部定时任务为可选通道（共享 60 秒节流）。
     $cron_cli = cron_cli_command();
     $cron_url = cron_secret_url();
     $html .= '<div class="note">'
-        . '<strong>如何让审核全自动？</strong>自动审核不依赖页面访问，而由服务器上的「定时任务（cron）」驱动：让服务器按固定频率（建议每分钟一次）调用一次任务入口即可（设置一次，长期有效）。该入口是所有插件定时任务的统一入口，配置一次即可同时满足其它插件的自动任务；入口很轻量，是否真正执行由任务自身的最小间隔决定（审核任务为 60 秒），调用更频繁也不会重复审核。<br>'
-        . '方式一（SSH 执行 <code>crontab -e</code>，添加一行；本地命令无需令牌）：<code>* * * * * ' . h($cron_cli) . '</code><br>'
-        . '方式二（宝塔 / 1Panel 等面板添加「每分钟」的计划任务，或任何能定时发请求的服务；注意：下方地址已自动附带安全令牌，必须整体复制使用）：<code>* * * * * curl -s "' . h($cron_url) . '" &gt;/dev/null</code><br>'
-        . '安全说明：HTTP 方式调用必须携带令牌（缺失或错误会返回 403）；令牌会随本页地址自动生成并展示，此前配置过旧地址的请替换为最新地址。没有条件配置定时任务时，用上面的「立即审核待审评论」手动执行完全等效。</div>';
+        . '<strong>审核如何自动执行？</strong>无需任何外部配置：站点只要有访问（含评论提交），就会在请求收尾阶段自动检查并执行到期的审核——页面响应先交给访客，AI 调用不占用访客等待；两轮最短间隔 60 秒，评论提交时若距上轮已满 60 秒即当轮处理，否则在下一次访问时补上。<br>'
+        . '<strong>可选：外部定时任务。</strong>如果你的主机已配置（或愿意配置）cron / 计划任务，也可继续用它驱动——适合访问量极低、希望审核更准时的站点；两条通道共享同一个 60 秒节流，不会重复执行。SSH 方式（<code>crontab -e</code> 添加一行）：<code>* * * * * ' . h($cron_cli) . '</code>；面板 / 外部服务方式（下方地址已自动附带安全令牌，必须整体复制）：<code>* * * * * curl -s "' . h($cron_url) . '" &gt;/dev/null</code><br>'
+        . '也可随时点「立即审核待审评论」手动补跑一轮。</div>';
 
     // 审核记录（分页，20 条/页；标注来源：文章 / 动态）。
     $page = current_page();
@@ -970,11 +1028,11 @@ JS;
 return [
     'id' => 'ai',
     'name' => 'AI 助手',
-    'version' => '1.3.0',
-    'description' => '接入 OpenAI 兼容接口：写文章页提供 AI 续写 / 润色 / 排版 / 自动生成标签，评论开启先审后显后可自动审核文章与动态评论（动态需启用「动态」插件并开启其评论开关）。',
+    'version' => '1.4.0',
+    'description' => '接入 OpenAI 兼容接口：写文章页提供 AI 续写 / 润色 / 排版 / 自动生成标签；评论开启先审后显后自动审核文章与动态评论——由站点流量驱动（评论提交后即触发、响应完成后执行），无需外部定时任务；动态评论需启用「动态」插件并开启其评论开关。',
     'author' => 'Mono',
     'assets' => ['css' => 'ai_css', 'js' => 'ai_js'],
-    'hooks' => ['page.before_render' => 'ai_write_inject'],
+    'hooks' => ['page.before_render' => 'ai_write_inject', 'app.boot' => 'ai_review_boot'],
     'routes' => ['ai_generate' => 'ai_generate'],
     'admin_tabs' => ['ai' => 'ai_admin'],
     'cron' => ['review' => ['callback' => 'ai_cron_review', 'interval' => 60]],

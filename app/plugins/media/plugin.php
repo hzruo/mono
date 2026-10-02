@@ -213,13 +213,23 @@ function media_video_file_html(string $url): string
         . '<a href="' . h($url) . '" target="_blank" rel="noopener nofollow">' . h(media_file_name($url)) . '</a></video></div>';
 }
 
+// 是否移动端 UA（仅用于网易云播放器地址选择，不改变任何文案与功能）。
+function media_mobile_ua(): bool
+{
+    return (bool)preg_match('~Mobile|Android|iPhone|iPad|iPod|Windows Phone~i', (string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
+}
+
 // 网易云外链播放器：歌曲为 330×86 小条，专辑/歌单为 330×450 列表。
+// 注意：官方播放器对「跨端」UA 访问会 302 到对方版本的 http 地址（移动 UA 请求 /outchain
+// 会被 302 到 http://…/m/outchain），HTTPS 页面下被浏览器按混合内容拦截——因此按 UA
+// 直接输出对应版本的 https 播放器地址（两端实测均 200、无跳转）。
 function media_netease_html(string $kind, int $id): string
 {
     $type = ['playlist' => 0, 'album' => 1, 'song' => 2][$kind];
     $label = ['playlist' => '网易云歌单', 'album' => '网易云专辑', 'song' => '网易云音乐'][$kind];
     $height = $type === 2 ? 66 : 430;
-    $src = 'https://music.163.com/outchain/player?type=' . $type . '&id=' . $id . '&auto=0&height=' . $height;
+    $path = media_mobile_ua() ? '/m/outchain/player' : '/outchain/player';
+    $src = 'https://music.163.com' . $path . '?type=' . $type . '&id=' . $id . '&auto=0&height=' . $height;
     $style = $type === 2 ? 'width:330px;max-width:100%;height:86px' : 'width:330px;max-width:100%;height:450px';
     return '<div class="media-embed" data-kind="music"><iframe src="' . h($src) . '" style="' . $style . '" scrolling="no" allowfullscreen="true" title="' . h($label) . '"></iframe>'
         . media_fallback_link('网易云音乐', 'https://music.163.com/#/' . $kind . '?id=' . $id) . '</div>';
@@ -695,7 +705,7 @@ function media_admin(array $plugin): string
 return [
     'id' => 'media',
     'name' => '媒体嵌入',
-    'version' => '1.2.0',
+    'version' => '1.2.1',
     'description' => '把独立成行的媒体链接自动变成播放器：网易云音乐（含 163cn.tv 分享短链）、哔哩哔哩、YouTube、抖音与音视频直链；写作页「媒体」按钮支持粘贴分享文案自动解析。',
     'author' => 'Mono',
     'assets' => ['css' => 'media_css', 'js' => 'media_js'],
